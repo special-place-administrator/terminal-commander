@@ -73,11 +73,28 @@ Measured, not assumed:
 | Same tests isolated | 44/44 CLI pass |
 | Full suite, `--test-threads 4` | **916/916 pass** |
 | Full suite, `--test-threads 4` (later, more tests) | **926/926 pass** |
+| Full suite, default parallelism (repeat, 929 tests) | **929/929 pass** |
 
-Windows named-pipe contention, not a regression. The six new
-`DaemonState::bootstrap` tests added to the pressure. `windows-gate.ps1` selects
-individual test binaries rather than running the whole suite, so it is not
-exposed to this.
+**Control experiment (the claim is not merely asserted).** `main` was checked
+out — none of this branch's code — and the same suite run at the same default
+parallelism:
+
+| Branch | Tests | Failures |
+|---|---|---|
+| `main` | 910 | **2** — `read_subcommands`, `pipe_client` retry |
+| this branch | 929 | **0** |
+
+`main` fails in the **same two test classes** without any of this work, and the
+identical branch configuration swung from 6 failures to 0. The flake is
+pre-existing and non-deterministic, not a regression introduced here.
+
+Residual, stated honestly: the branch showed 6 failures on one run where `main`
+showed 2. Given the observed run-to-run swing that may be noise, but the six new
+`DaemonState::bootstrap` tests plausibly add named-pipe pressure. Recorded as an
+open question for review rather than dismissed.
+
+`windows-gate.ps1` selects individual test binaries rather than running the
+whole suite, so it is not exposed to this.
 
 ### Live dogfood
 
