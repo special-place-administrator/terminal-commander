@@ -2019,7 +2019,7 @@ fn evidence_json(
 /// shutdown or stale replacement rather than reaching its own conclusion. The
 /// terminal state stays the truthful `cancelled` (spec decision D1).
 #[allow(clippy::too_many_arguments)]
-fn persist_job_receipt(
+pub(crate) fn persist_job_receipt(
     store: &StoreClient,
     job_id: JobId,
     bucket_id: BucketId,

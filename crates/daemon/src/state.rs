@@ -317,6 +317,7 @@ impl DaemonState {
             policy.clone(),
             Arc::clone(&activation),
             Arc::clone(&sources),
+            store.clone(),
         ));
         // Session runtime (P1 / TC50): wraps the SAME `Arc<PtyRuntime>` so
         // a session is just a long-lived login-shell PTY job. Sizes the

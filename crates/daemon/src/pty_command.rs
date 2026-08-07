@@ -175,6 +175,10 @@ mod runtime {
         /// Bucket source side-table (subscriptions MUST-ADD #2).
         /// Recorded at `start` immediately after `bucket_create`.
         sources: Arc<crate::subscriptions::source::BucketSourceTable>,
+        /// Single-writer store actor. spec 004: the PTY lane persists a job
+        /// receipt on its terminal transition, mirroring the combed lane, so a
+        /// PTY outcome is reconstructable after a restart instead of vanishing.
+        store: crate::store_actor::StoreClient,
     }
 
     impl std::fmt::Debug for PtyRuntime {
@@ -191,7 +195,10 @@ mod runtime {
         clippy::type_complexity,
         clippy::assigning_clones,
         clippy::collapsible_if,
-        clippy::option_if_let_else
+        clippy::option_if_let_else,
+        // spec 004: `new` gained the store client so the PTY lane can persist a
+        // receipt on its terminal transition, matching the combed lane.
+        clippy::too_many_arguments
     )]
     impl PtyRuntime {
         #[must_use]
@@ -203,6 +210,7 @@ mod runtime {
             policy: PolicyEngine,
             activation: Arc<ActivationRegistry>,
             sources: Arc<crate::subscriptions::source::BucketSourceTable>,
+            store: crate::store_actor::StoreClient,
         ) -> Self {
             let profile_label = match policy.profile {
                 PolicyProfile::DeveloperLocal => "developer_local".to_owned(),
@@ -221,6 +229,7 @@ mod runtime {
                 live: Arc::new(RwLock::new(HashMap::default())),
                 activation,
                 sources,
+                store,
             }
         }
 
@@ -523,6 +532,13 @@ mod runtime {
             // the job ledger on exit without ever locking the probe mutex
             // (which `write_stdin` holds across `.await`).
             let completion = probe.take_completion();
+            // spec 004: hold the probe behind a shared cell created BEFORE the
+            // lifecycle waiter spawns, so the waiter can read the probe's real
+            // final counters at exit. Persisting a receipt from the sink
+            // snapshot alone would record events_emitted with zeroed frames and
+            // bytes -- an evidence-stripped receipt, which is precisely the
+            // defect this work removes.
+            let probe_cell = Arc::new(tokio::sync::Mutex::new(Some(probe)));
 
             let job_cfg = JobConfig {
                 job_id,
@@ -548,6 +564,9 @@ mod runtime {
                 let waiter_audit = Arc::clone(&self.audit);
                 let waiter_profile = self.profile_label.clone();
                 let argv0 = req.argv[0].clone();
+                let waiter_store = self.store.clone();
+                let waiter_probe = Arc::clone(&probe_cell);
+                let waiter_metrics = Arc::clone(&metrics);
                 tokio::spawn(async move {
                     // A dropped sender (probe dropped before it could send)
                     // is treated as a cancellation: the job did not exit
@@ -570,6 +589,12 @@ mod runtime {
                     }) {
                         return;
                     }
+                    // Capture the exit code before `outcome` is moved into the
+                    // draft match below. A cancelled PTY job has no exit code.
+                    let receipt_exit_code = match &outcome {
+                        terminal_commander_probes::PtyExitOutcome::Exited { code, .. } => *code,
+                        terminal_commander_probes::PtyExitOutcome::Cancelled => None,
+                    };
                     let (draft, action, reason) = match outcome {
                         terminal_commander_probes::PtyExitOutcome::Exited { code, signal } => {
                             let nonzero = !matches!(code, Some(0)) || signal.is_some();
@@ -593,6 +618,43 @@ mod runtime {
                     if let Some(d) = draft.as_ref() {
                         let _ = waiter_router.bucket_append(bucket_id, d.clone());
                     }
+
+                    // spec 004 FR-002: persist the terminal outcome WITH the
+                    // evidence a live observer would have had, so a PTY job
+                    // stays reconstructable after a restart. Read the probe's
+                    // real counters the same way `list()` and `status()` do.
+                    //
+                    // Unlike the combed lane there is no +1 here: the append
+                    // above goes straight to the router, bypassing the sink
+                    // that owns `events_emitted`, so the counter is already
+                    // final.
+                    let final_metrics = if let Ok(guard) = waiter_probe.try_lock() {
+                        let pm = guard
+                            .as_ref()
+                            .map_or_else(PtyProbeMetrics::default, PtyProbe::metrics);
+                        let snap = waiter_metrics.lock().clone();
+                        combine_pty_metrics(&pm, &snap)
+                    } else {
+                        waiter_metrics.lock().clone()
+                    };
+                    let rec = waiter_jobs.get(job_id);
+                    let terminal_state = rec
+                        .as_ref()
+                        .map_or(terminal_commander_core::JobState::Failed, |r| r.state);
+                    let duration_ms = rec
+                        .as_ref()
+                        .and_then(|r| r.exit_info.as_ref().map(|e| e.duration_ms));
+                    let evidence = pty_evidence_json(&final_metrics, duration_ms, probe_id);
+                    crate::command::persist_job_receipt(
+                        &waiter_store,
+                        job_id,
+                        bucket_id,
+                        terminal_state,
+                        receipt_exit_code,
+                        final_metrics.events_emitted,
+                        Some(&evidence),
+                        None,
+                    );
                     let mut entry = AuditEntry::new(action, job_id.to_wire_string(), "info")
                         .with_actor("pty_runtime")
                         .with_profile(waiter_profile)
@@ -615,7 +677,7 @@ mod runtime {
                     argv: req.argv.clone(),
                     sifter,
                     inline_rules: req.rules,
-                    probe: Arc::new(tokio::sync::Mutex::new(Some(probe))),
+                    probe: probe_cell,
                     metrics_snapshot: metrics,
                 },
             );
@@ -959,6 +1021,37 @@ mod runtime {
             events_emitted: probe.events_emitted.max(snapshot.events_emitted),
             ..*probe
         }
+    }
+
+    /// Build the bounded evidence object persisted alongside a PTY job receipt
+    /// (spec 004 FR-002).
+    ///
+    /// NUMERIC AND IDENTIFIER DATA ONLY -- constitution III bars raw frames from
+    /// persistent output, and a PTY stream is exactly where secret-prompt echo
+    /// could appear, so no frame text is written here under any circumstance.
+    ///
+    /// A PTY is ONE merged stream, so there is no stdout/stderr split to record;
+    /// the reader attributes `frames_total` to stdout, matching `status()`.
+    fn pty_evidence_json(
+        metrics: &PtyProbeMetrics,
+        duration_ms: Option<u64>,
+        probe_id: ProbeId,
+    ) -> String {
+        let duration = duration_ms.map_or_else(|| "null".to_owned(), |d| d.to_string());
+        format!(
+            "{{\"frames_total\":{},\"frames_stdout\":{},\"frames_stderr\":0,\
+             \"bytes_total\":{},\"frames_suppressed\":{},\
+             \"frames_suppressed_progress\":{},\"frames_suppressed_dedupe\":{},\
+             \"duration_ms\":{},\"probe_id\":\"{}\"}}",
+            metrics.frames_total,
+            metrics.frames_total,
+            metrics.bytes_total,
+            metrics.frames_suppressed,
+            metrics.frames_suppressed_progress,
+            metrics.frames_suppressed_dedupe,
+            duration,
+            probe_id.to_wire_string(),
+        )
     }
 
     #[cfg(test)]
