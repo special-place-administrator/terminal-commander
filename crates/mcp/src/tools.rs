@@ -168,7 +168,7 @@ pub const fn tool_catalogue() -> &'static [ToolCatalogueEntry] {
         ToolCatalogueEntry {
             name: "command_status",
             status: ToolStatus::Live,
-            description: "Lifecycle + counters lookup for a previously started job.",
+            description: "Lifecycle + counters lookup for a previously started job, with an explicit outcome_trust provenance field.",
         },
         ToolCatalogueEntry {
             name: "command_stop",
@@ -1290,7 +1290,7 @@ impl TerminalCommanderMcpServer {
     /// bucket_wait (bounded) -> command_status so the agent needs ONE
     /// call instead of four.
     #[tool(
-        description = "Run a command and get its matching signals AND exit code in ONE call. Composes start + bounded wait + status so you don't poll. Pass inline `rules` (minimal: [{\"pattern\": \"ERROR\"}]) to comb the output; returns {signals, exit_code, state, receipt, complete, wait_exhausted, cursor, degraded, recover_hint}. A quiet command (no rule matches) returns a bounded receipt instead of an error — TC never bounces you to the shell for running a small command. Bounded: waits up to wait_ms (default 5000, max 60000) as a WALL-CLOCK budget (honored within one ~1s slice plus a round-trip) and returns up to max_signals (default 50). If `complete` is false (wait_exhausted), the command is STILL RUNNING; continue signals with bucket_wait using the returned bucket_id/cursor/timeout_ms, and poll command_status with job_id for final state/exit_code. command_status does not return signals. If `degraded` is true, an IPC error interrupted the wait but the job is still tracked: confirm daemon health, then follow recover_hint — once a job_id exists this call returns a degraded, job-identified result, never a bare error. Argv only; shell interpreters denied. Prefer plain shell for tiny one-off commands whose full verbatim output you want."
+        description = "Run a command and get its matching signals AND exit code in ONE call. Composes start + bounded wait + status so you don't poll. Pass inline `rules` (minimal: [{\"pattern\": \"ERROR\"}]) to comb the output; returns {signals, exit_code, state, receipt, complete, wait_exhausted, cursor, degraded, recover_hint, outcome_trust}. `outcome_trust` reports how the daemon knows the returned state/exit_code (observed | reconstructed | lost | abandoned) and, like degraded/recover_hint, is present on EVERY payload rather than only the unusual ones; see command_status for the full meaning of each value. A quiet command (no rule matches) returns a bounded receipt instead of an error — TC never bounces you to the shell for running a small command. Bounded: waits up to wait_ms (default 5000, max 60000) as a WALL-CLOCK budget (honored within one ~1s slice plus a round-trip) and returns up to max_signals (default 50). If `complete` is false (wait_exhausted), the command is STILL RUNNING; continue signals with bucket_wait using the returned bucket_id/cursor/timeout_ms, and poll command_status with job_id for final state/exit_code. command_status does not return signals. If `degraded` is true, an IPC error interrupted the wait but the job is still tracked: confirm daemon health, then follow recover_hint — once a job_id exists this call returns a degraded, job-identified result, never a bare error. Argv only; shell interpreters denied. Prefer plain shell for tiny one-off commands whose full verbatim output you want."
     )]
     async fn run_and_watch(
         &self,
@@ -1352,6 +1352,9 @@ impl TerminalCommanderMcpServer {
         // "unknown" if the daemon failed before the first poll), so the agent
         // cannot mistake an unconfirmed job for a confirmed-running one.
         let mut last_observed_state: Option<JobState> = None;
+        // spec 004: mirrors `last_observed_state` -- the provenance of the
+        // status we actually got. Stays None if no poll ever succeeded.
+        let mut last_outcome_trust: Option<terminal_commander_ipc::OutcomeTrust> = None;
         let mut exit_code: Option<i32> = None;
         // Deferred init: every normal loop exit assigns `receipt` first, and the
         // degraded arms pass `None` (a degraded result carries no receipt), so a
@@ -1380,6 +1383,7 @@ impl TerminalCommanderMcpServer {
                         bucket_id,
                         resume_cursor,
                         last_observed_state,
+                        last_outcome_trust,
                         exit_code,
                         &signals,
                         None,
@@ -1393,6 +1397,7 @@ impl TerminalCommanderMcpServer {
                 }
             };
             last_observed_state = Some(status.state);
+            last_outcome_trust = Some(status.outcome_trust);
             exit_code = status.exit_code;
             receipt = status.receipt.as_ref().map(|r| serde_json::json!(r));
 
@@ -1445,6 +1450,7 @@ impl TerminalCommanderMcpServer {
                         bucket_id,
                         resume_cursor,
                         last_observed_state,
+                        last_outcome_trust,
                         exit_code,
                         &signals,
                         None,
@@ -1505,6 +1511,7 @@ impl TerminalCommanderMcpServer {
             bucket_id,
             resume_cursor,
             last_observed_state,
+            last_outcome_trust,
             exit_code,
             &signals,
             receipt,
@@ -1522,7 +1529,7 @@ impl TerminalCommanderMcpServer {
 
     /// `command_status` — lifecycle counters + exit info for a job.
     #[tool(
-        description = "Lookup bounded counters and exit info for a previously started job. Never returns raw stream text, with one exception: when the command finished and ZERO rules matched, a bounded exit receipt (exit code, suppressed-line count, short tail) is included so a no-rule command is never silent."
+        description = "Lookup bounded counters and exit info for a previously started job. `outcome_trust` tells you HOW the daemon knows: `observed` (witnessed live -- every counter is a real observation), `reconstructed` (read back from the durable receipt after a restart -- state/exit_code are truthful and the counters are the values captured when the job finished), `lost` (the daemon recorded this job starting and never recorded it finishing -- NEVER treat as success), `abandoned` (ended by daemon shutdown or replacement rather than by the job itself; reported as cancelled with no exit code, and is NOT a failure). `restarted` is the older boolean alias for 'not observed live'; prefer `outcome_trust`. Never returns raw stream text, with one exception: when the command finished and ZERO rules matched, a bounded exit receipt (exit code, suppressed-line count, short tail) is included so a no-rule command is never silent. That receipt is memory-only and does NOT survive a daemon restart -- its absence after a restart does not mean the command produced no output."
     )]
     async fn command_status(
         &self,
@@ -3513,6 +3520,11 @@ fn run_and_watch_result(
     bucket_id: terminal_commander_core::BucketId,
     cursor: u64,
     last_observed_state: Option<terminal_commander_core::JobState>,
+    // spec 004: provenance of `last_observed_state` / `exit_code`. `None` when
+    // no status was obtained at all (a degraded wait that never got an answer),
+    // which serializes as null -- the honest shape, mirroring how `state`
+    // becomes "unknown" rather than a silent "running".
+    outcome_trust: Option<terminal_commander_ipc::OutcomeTrust>,
     exit_code: Option<i32>,
     signals: &[terminal_commander_core::SignalEvent],
     receipt: Option<serde_json::Value>,
@@ -3585,6 +3597,9 @@ fn run_and_watch_result(
         "cursor": cursor,
         "degraded": degraded,
         "recover_hint": recover_hint,
+        // spec 004 FR-006: present on every payload, null only when no status
+        // was ever obtained. Never guessed.
+        "outcome_trust": outcome_trust,
     }))
 }
 
@@ -6282,6 +6297,7 @@ mod tests {
             terminal_commander_core::BucketId::new(),
             7,
             last_observed_state,
+            None,
             exit_code,
             signals,
             None,

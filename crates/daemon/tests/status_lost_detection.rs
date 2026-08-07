@@ -152,7 +152,11 @@ fn a_denied_or_failed_start_does_not_read_as_a_lost_job() {
     let denied = terminal_commander_core::JobId::new().to_wire_string();
     state
         .audit
-        .emit(&AuditEntry::new("pty_command_start", denied.clone(), "deny"))
+        .emit(&AuditEntry::new(
+            "pty_command_start",
+            denied.clone(),
+            "deny",
+        ))
         .expect("audit emit");
     assert!(
         !state.store.job_start_recorded(&denied).expect("lookup"),
