@@ -38,115 +38,62 @@ Open before a 1.0.0: merge the review branches (human-gated); close O-07
 (ConPTY child-output on a real Windows desktop/CI), O-08 (macOS host), O-09/O-10
 (SSH/container), O-14 (provider trust smokes); complete the P4 threat review.
 
-## P0 — Beta blockers (active)
+## P0 — Beta blockers (none active)
 
-The four original P0 items are resolved (see "Resolved P0" below).
-Two new P0 trust defects were found by the TC trust-defects campaign
-(`.planning/tc-bugfix-campaign/`); both violate the "run a command
-safely" product promise at HEAD.
+All P0 items are resolved (see "Resolved P0" below). The four original
+items closed with the TC33-TC47 runtime chain; the two P0 trust defects
+found by the TC trust-defects campaign (`.planning/tc-bugfix-campaign/`)
+are both fixed at HEAD and were re-verified against source on
+2026-08-07 while assessing release readiness.
 
-### P0.1 — TC-1a: client-timeout blind retry double-spawns a command
+### P0.1 — TC-1a: client-timeout blind retry double-spawns (RESOLVED)
 
-**Source:** TC trust-defects campaign, Phase 1
-(`.planning/tc-bugfix-campaign/PLAN-TC1-ghost-spawn.md`).
-**Evidence:** `crates/mcp/src/daemon_client.rs:191-198` re-sends a
-cloned request on any transport error
-(`Err(e) if e.is_transport()`), with no idempotency check. A >5s
-client timeout on a `CommandStartCombed` therefore re-sends a
-mutating start while the first spawn may already be running =>
-DOUBLE SPAWN. The mid-call envelope compounds it:
-`crates/mcp/src/tools.rs:1804-1805` remedy literally says
-"retry the tool", and `tools.rs:1808` routes through
-`McpError::internal_error` (numeric -32603) while the doc comment
-at `tools.rs:1790-1796` falsely claims "never a raw internal_error
-(-32603)".
-**Impact:** A timed-out start can silently run twice; the agent is
-told to retry the exact mutating op. This is a regression at HEAD
-and the highest-harm item in the campaign.
-**Proposed work:** Add `pub const fn is_idempotent(&self)` to
-`IpcRequest` (`crates/ipc/src/protocol.rs`), gate the retry on
-`request.is_idempotent()`, split self-heal from re-send, and fix
-the lying doc comment + the "retry the tool" remedy (make it
-operation-neutral). Pure logic; zero daemon state.
-**Scope:** `crates/ipc/src/protocol.rs`,
-`crates/mcp/src/daemon_client.rs`, `crates/mcp/src/tools.rs`.
+**Was:** `crates/mcp/src/daemon_client.rs` re-sent a cloned request on any
+transport error, so a >5s client timeout on a `CommandStartCombed` could
+re-send a mutating start while the first spawn was still running.
+**Resolved by:** `IpcRequest::is_idempotent()`
+(`crates/ipc/src/protocol.rs`) now gates the re-send. Self-heal is split
+from re-send: the heal always runs, but only idempotent RPCs are retried
+(`crates/mcp/src/daemon_client.rs:433-445`). Mutating RPCs -- including
+`CommandStartCombed` and every registry write -- return the transport
+error instead of double-spawning.
 
-### P0.2 — TC-1b: run_and_watch discards a live job handle on mid-wait IPC error
+### P0.2 — TC-1b: run_and_watch discards a live job handle (RESOLVED)
 
-**Source:** TC trust-defects campaign, Phase 3
-(`.planning/tc-bugfix-campaign/PLAN-TC1b-TC6-waitloop.md`).
-**Evidence:** Once `run_and_watch` holds a job_id (the start RPC at
-`crates/mcp/src/tools.rs:630-643` succeeded), any subsequent
-in-loop RPC error returns `Err(into_mcp_error)` and discards the
-known job_id/bucket_id/cursor/signals: the CommandStatus arm at
-`tools.rs:665` and the BucketWait arm at `tools.rs:703`.
-**Impact:** The agent is told "error" with no way to recover a
-still-running job; the live job_id is thrown away (trust-destroying
-discard).
-**Proposed work:** Convert both post-job_id error arms to a
-DEGRADED isError:false result that is a strict superset of the
-existing payload (`{job_id, bucket_id, state (last-observed/UNKNOWN,
-never silently Running), cursor, signals, complete:false,
-wait_exhausted:true, degraded:true, recover_hint}`); the start-arm
-error still returns Err. Co-implemented with TC-6 in one wait-loop
-rewrite (shared body `tools.rs:650-709`).
-**Scope:** `crates/mcp/src/tools.rs`,
-`tests/fixtures/contracts/mcp-tools/run_and_watch.v1.json`.
+**Was:** once `run_and_watch` held a `job_id`, any in-loop RPC error
+returned `Err` and threw the live handle away.
+**Resolved by:** both post-`job_id` error arms now return a DEGRADED
+`isError:false` result that is a strict superset of the normal payload
+(`crates/mcp/src/tools.rs:1380` CommandStatus arm, `:1447` BucketWait
+arm), carrying `job_id`, `bucket_id`, `cursor`, `signals`,
+`last_observed_state`, `complete:false`, `degraded:true` and a
+`recover_hint`. The start-arm error still returns `Err`, as designed.
 
 ## P1 — High priority follow-ups
 
-### P1.0a — TC-2: no in-flight dedup guard (manual-retry double-spawn)
+### P1.0a — TC-2: in-flight dedup guard (RESOLVED)
 
-**Source:** TC trust-defects campaign, Phase 2
-(`.planning/tc-bugfix-campaign/PLAN-TC2-dedup.md`).
-**Evidence:** No idempotency/dedup guard exists anywhere in the
-daemon: `crates/daemon/src/command.rs` `start_combed` (builds from
-`CommandStartRequest` at `command.rs:572-581`) has no pre-spawn
-lookup, and `RequestEnvelope` has no key. After P0.1 removes the
-AUTOMATIC double-spawn, the residual path is a MANUAL caller/LLM
-re-call of a timed-out mutating start.
-**Impact:** A deliberate re-call still spawns a second identical
-job; trust defense-in-depth is missing.
-**Proposed work:** Add a NEW `Arc<Mutex<HashMap<u64,(JobId,BucketId,
-Instant)>>>` field on `CommandRuntime` (NOT behind the live lock),
-checked at the top of `start_combed`, keyed preferentially on a
-client nonce (`dedup_nonce`, adapter always generates one) with a
-short peer-scoped argv+cwd+tag fallback; thread `dedup_nonce`
-through `CommandStartParams` -> `CommandStartRequest` ->
-`handle_command_start_combed` (`crates/daemon/src/ipc/handlers/
-command.rs`) or it is silently dropped; evict on EVERY completion
-path (exit/cancel/spawn-failure). Never collapses two
-legitimately-distinct rapid runs.
-**Scope:** `crates/daemon/src/command.rs`,
-`crates/ipc/src/protocol.rs`,
-`crates/daemon/src/ipc/handlers/command.rs`,
-`crates/mcp/src/tools.rs`.
+**Was:** no idempotency/dedup guard anywhere in the daemon, so a MANUAL
+caller/LLM re-call of a timed-out mutating start spawned a second
+identical job.
+**Resolved by:** `CommandRuntime.dedup` — an `Arc<Mutex<HashMap<...>>>`
+checked at the top of `start_combed` BEFORE the id mint
+(`crates/daemon/src/command.rs:863-875`), keyed preferentially on the
+client nonce with a short peer-scoped argv+cwd+tag fallback
+(`dedup_key`, `command.rs:2471`). A duplicate returns the REAL ids of
+the in-flight job (never a fake success). Registered pre-spawn
+(`command.rs:1204`) so the slow-spawn window is covered, and evicted on
+every completion path including the `stop()` early return
+(`command.rs:1438-1442`).
 
-### P1.0b — TC-3: no command-job stop tool on the MCP surface
+### P1.0b — TC-3: command-job stop tool on the MCP surface (RESOLVED)
 
-**Source:** TC trust-defects campaign, Phase 6a/6b
-(`.planning/tc-bugfix-campaign/PLAN-TC3-command-stop.md`).
-**Evidence:** A started command job cannot be stopped from the MCP
-surface; only PTY has `pty_command_stop`. `CommandRuntime` has no
-stop/cancel/kill; `JobBinding` (`crates/daemon/src/command.rs:218-230`)
-retains no cancel handle and derives `Clone`; no `CommandStop` IPC
-method; `PolicyAction::CommandSignal` is dormant
-(`crates/daemon/src/policy.rs:62`); the command waiter
-(`command.rs:668-680`) has NO terminal-state guard (contrast PTY
-`crates/daemon/src/pty_command.rs:391-400`).
-**Impact:** Advertised command-lifecycle control is incomplete; a
-long-running command job is unstoppable through the tool surface.
-**Proposed work:** Add `command_stop` / `IpcRequest::CommandStop`
-(forced-kill-only). Phase 6a: `take_cancel_handle()`
-(`crates/probes/src/process.rs`), a `cancel` field on `JobBinding`
-(remove the `Clone` derive), a command-waiter terminal-state guard,
-`CommandRuntime::stop` (policy-deny FIRST with peer-subject audit;
-check-then-set Cancelled), the IPC method + 3 re-exports + dispatch.
-Phase 6b: the MCP tool + ALL atomic count anchors (5 name lists + 3
-count assertions + fixture map + system_discover fixture +
-minimal_tool_args) bumped 37->38 + docs.
-**Scope:** ~16 files across 6a/6b (EXEMPT from the <=10-file rule;
-atomic count-anchor set).
+**Was:** a started command job could not be stopped from the MCP
+surface; only PTY had `pty_command_stop`.
+**Resolved by:** `command_stop` is live on the MCP surface
+(`crates/mcp/src/tools.rs:1551`) over `IpcRequest::CommandStop`,
+forced-kill-only, returning final bounded counters and never raw
+output. The tool count moved 37->38 with the atomic count-anchor set.
 
 ### P1.0c — TC-4: anonymous runtime_state probe rows + run_and_watch tag:None
 
@@ -367,37 +314,23 @@ their Cursor MCP config path; starts the daemon; asks Cursor chat
 to call `health` and `command_start_combed` -> `bucket_wait` ->
 `command_status`; captures evidence.
 
-### P1.5 — First live npm publish (operator preconditions)
+### P1.5 — First live npm publish (RESOLVED)
 
 **Source:** NPM07 + NPM09 final reports + NPM10 policy exception.
-**Evidence:** `.github/workflows/release-please.yml` carries an
-output-gated, OIDC-only publish path. All three package names
-return `E404` from `npm view` on 2026-05-23 — unpublished /
-available. Live publish jobs were correctly `skipped` on the
-NPM06 / NPM07 / NPM08 / NPM08b / NPM09 live runs because
-`releases_created='false'` (no Conventional-Commits-eligible
-commits since the manifest seed).
-**Impact:** Until the FIRST publish lands, npmjs.com cannot offer
-the trusted-publisher configuration UI on a package page that does
-not yet exist. NPM10 added a one-time bootstrap workflow
-(`.github/workflows/npm-bootstrap-publish.yml`,
-`workflow_dispatch` only, two-gate confirm, NPM_TOKEN_TC) so the
-first publish can land via token; every subsequent publish goes
-through NPM07's OIDC path.
-**Proposed work (post-NPM10):**
-1. Operator dispatches `npm-bootstrap-publish` in dry-run mode and
-   verifies the three platform / root publish jobs succeed.
-2. Operator dispatches `npm-bootstrap-publish` with
-   `dry_run = false` AND
-   `confirm_publish = "publish-terminal-commander-beta"`.
-3. After the real publish, operator configures trusted publisher
-   for each of the three package pages on npmjs.com with workflow
-   filename `release-please.yml`.
-4. Operator lands a Conventional-Commits `feat:` / `fix:` commit;
-   release-please opens a release PR; operator reviews + merges
-   it. The OIDC publish jobs fire on the merge push.
+**Was:** all three package names returned `E404` from `npm view` on
+2026-05-23, and npmjs.com could not offer the trusted-publisher UI for
+a package page that did not yet exist.
+**Resolved.** Verified against the live registry on 2026-08-07:
+`terminal-commander` resolves with `dist-tags.latest = 0.1.86`, and the
+platform packages `@terminal-commander/{linux-x64,linux-arm64,
+windows-x64,mac-x64,mac-arm64}` all resolve (HTTP 200). The OIDC path
+is exercised, not merely configured: release PR #163 merged 2026-07-17
+and its `release-please` run published in 16m29s.
 
-After step 3 + step 4 succeed, P1.5b (below) fires.
+Publishing is therefore a normal two-gate flow, NOT automatic on a
+feature merge: merging a Conventional-Commits `feat:`/`fix:` PR to
+`main` makes release-please open/update a release PR; merging THAT
+release PR bumps the version and fires the OIDC publish jobs.
 
 ### P1.5b — Disable the NPM10 bootstrap workflow + rotate NPM_TOKEN_TC
 
@@ -409,7 +342,13 @@ publishing via `release-please.yml`. The bootstrap workflow must
 not remain dispatchable after the first publish succeeds, otherwise
 an accidental dispatch could publish a token-authorized version
 that bypasses the OIDC + provenance contract.
-**Proposed work (post-first-publish, post-trusted-publisher-config):**
+**Status (2026-08-07): ACTIONABLE, and now overdue.** The first-publish
+precondition was met on 2026-07-17 (see P1.5), but
+`.github/workflows/npm-bootstrap-publish.yml` is still present and
+still `workflow_dispatch`-able at HEAD. Whether trusted publishing is
+configured on npmjs.com and whether `NPM_TOKEN_TC` still exists are
+operator-side facts that cannot be verified from the repository.
+**Proposed work:**
 1. Delete `.github/workflows/npm-bootstrap-publish.yml` OR rename
    it to `.disabled` so GitHub Actions stops indexing it.
 2. Rotate / invalidate `NPM_TOKEN_TC` on npmjs.com.
@@ -529,7 +468,7 @@ landed); they are post-publish enhancements.
 
 | ID    | Item | Reason |
 |-------|------|--------|
-| WWS-B1 | First live npm publish | Pending operator npmjs.com trusted-publisher setup + release PR merge (`docs/release/npm-trusted-publishing-contract.md` §8). Until then `terminal-commander setup cursor-wsl --install-wsl-runtime` returns `npm_package_unpublished` honestly. |
+| WWS-B1 | First live npm publish | **DONE 2026-07-17.** `terminal-commander@0.1.86` and all five `@terminal-commander/*` platform packages resolve on the live registry (verified 2026-08-07). See P1.5. |
 | WWS-B2 | Windows → WSL MCP bridge round-trip live evidence | WWS07 PowerShell smoke records `runtime_missing` honestly. Re-run after WWS-B1 to capture an MCP `initialize` + `tools/list` + `tools/call(health)` transcript through the WWS04 bridge. |
 | WWS-B3 | Cursor provider GUI live smoke transcript | No headless Cursor MCP discovery entry point. Operator opens Cursor → confirms `terminal-commander` in Settings → asks for `health` from chat → attaches transcript. Required before beta posture can promote `Conditional Go` → `Go`. |
 | WWS-B4 | `terminal-commander setup cursor-wsl --uninstall` | D-14 rollback (partial at WWS06). The WWS05 writer already produces `<mcp.json>.bak`; the uninstall flow restores it. NOT implemented at WWS06. |
