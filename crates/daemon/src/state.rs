@@ -182,7 +182,9 @@ impl DaemonState {
     ///
     /// Best-effort throughout: a job that vanishes mid-iteration or a failed write
     /// is logged and skipped. Shutdown must not be blockable by bookkeeping.
-    pub fn record_abandoned_jobs(&self) {
+    /// Returns how many jobs were recorded, so a `QuiesceForReplace` caller can
+    /// report what the outgoing daemon accounted for.
+    pub fn record_abandoned_jobs(&self) -> u32 {
         use terminal_commander_core::JobState;
 
         let mut recorded = 0_u32;
@@ -236,6 +238,7 @@ impl DaemonState {
                 "recorded abandonment for jobs still in flight at shutdown"
             );
         }
+        recorded
     }
 
     /// spec 004 FR-004: live status from the runtime that OWNS this job.

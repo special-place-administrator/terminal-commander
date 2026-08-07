@@ -299,7 +299,8 @@ pub const MAX_PULL_TIMEOUT_MS: u64 = 8_000;
 ///
 /// Method names are namespaced `<domain>_<verb>` to match the MCP tool
 /// names; the rmcp adapter maps each daemon-backed tool 1:1 to a method.
-/// 49 IPC methods are live, including the `audit_since` read surface.
+/// 50 IPC methods are live, including the `audit_since` read surface and the
+/// supervisor-only `quiesce_for_replace` verb.
 /// The full rmcp catalogue exposes 51 granular tools (see
 /// `docs/mcp/TOOL_CONTROL_SURFACE.md` §2); the compact MCP surface instead
 /// advertises five facade tools, gated by `TC_SURFACE=compact`, that forward
@@ -474,6 +475,23 @@ pub enum IpcRequest {
     /// requests, removes its pidfile, and exits 0. New connections during the
     /// drain receive `ShuttingDown` (retryable).
     Shutdown,
+    /// spec 004 FR-013: ask a daemon that is about to be REPLACED to durably
+    /// record its in-flight jobs as abandoned before it is killed.
+    ///
+    /// The replacer cannot do this itself: the in-flight set lives in the
+    /// outgoing daemon's memory, not on disk. So the outgoing daemon writes its
+    /// own records, and the replacer waits a bounded beat before hard-killing
+    /// as it does today.
+    ///
+    /// Strictly weaker than [`Self::Shutdown`]: spawns nothing, kills nothing,
+    /// exits nothing. It only writes rows about the daemon's own jobs, so it
+    /// carries the same authorization posture -- protected by the local-only
+    /// endpoint and attested peer identity, not by a capability flag.
+    ///
+    /// Quiescing MUST NEVER be able to block a replacement: a timeout, an
+    /// error, or an older daemon that does not know this verb all fall back to
+    /// current behaviour.
+    QuiesceForReplace,
 }
 
 impl IpcRequest {
@@ -556,7 +574,12 @@ impl IpcRequest {
             // Contrast BucketWait, which is client-cursor-driven and fully
             // replayable.
             | Self::SubscriptionPull(_)
-            | Self::Shutdown => false,
+            | Self::Shutdown
+            // spec 004 FR-013. The write itself is idempotent (INSERT OR
+            // REPLACE of the same terminal row), but it is still a server-side
+            // mutation and the caller is about to kill this daemon anyway --
+            // a blind retry buys nothing. Grouped conservatively with Shutdown.
+            | Self::QuiesceForReplace => false,
 
             // Pure bounded reads + idempotent-effect repositioning: a
             // retry observes state without changing it (or re-applies the
@@ -691,6 +714,11 @@ pub enum IpcResponse {
     /// new connections and begun draining.
     ShutdownAck {
         draining: bool,
+    },
+    /// ACK for [`IpcRequest::QuiesceForReplace`]: how many in-flight jobs were
+    /// recorded as abandoned. Zero is a normal answer (an idle daemon).
+    QuiesceAck {
+        recorded: u32,
     },
 }
 

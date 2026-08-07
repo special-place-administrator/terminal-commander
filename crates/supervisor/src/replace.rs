@@ -737,6 +737,28 @@ pub async fn replace_if_stale(
         };
     }
 
+    // spec 004 FR-013: give the outgoing daemon a bounded chance to record its
+    // in-flight jobs as abandoned BEFORE we kill it. The replacer cannot do
+    // this itself -- that set lives only in the outgoing daemon's memory.
+    //
+    // This is not redundant with the graceful leg of `hard_kill`: on Windows
+    // there is no graceful leg at all (`TerminateProcess` is a single forced
+    // terminate), and on unix the 800ms SIGTERM grace is shorter than the
+    // daemon's 10s lifecycle-drain ceiling, so a busy daemon would be killed
+    // before it finished recording.
+    //
+    // Courtesy only: any failure, timeout, or older daemon that does not know
+    // the verb falls straight through to the kill below. Quiescing MUST NEVER
+    // be able to block a replacement.
+    match crate::ensure::quiesce_endpoint(&opts.endpoint).await {
+        Some(recorded) if recorded > 0 => {
+            eprintln!(
+                "terminal-commander: outgoing daemon recorded {recorded} in-flight job(s) as abandoned"
+            );
+        }
+        _ => {}
+    }
+
     if let Err(e) = hard_kill(pid, &opts.state_dir) {
         return ReplaceOutcome::Skipped {
             reason: format!("hard-kill pid {pid} failed: {e}"),

@@ -464,6 +464,7 @@ const fn method_name(req: &IpcRequest) -> &'static str {
         IpcRequest::SubscriptionClose(_) => "subscription_close",
         IpcRequest::SubscriptionSeek(_) => "subscription_seek",
         IpcRequest::Shutdown => "shutdown",
+        IpcRequest::QuiesceForReplace => "quiesce_for_replace",
     }
 }
 
@@ -524,6 +525,7 @@ pub(crate) const DISCOVERABLE_METHODS: &[&str] = &[
     "subscription_close",
     "subscription_seek",
     "shutdown",
+    "quiesce_for_replace",
 ];
 
 #[allow(clippy::too_many_lines)] // method dispatcher
@@ -855,6 +857,18 @@ async fn dispatch(
             state.trigger_shutdown();
             IpcResult::Ok {
                 response: IpcResponse::ShutdownAck { draining: true },
+            }
+        }
+        // spec 004 FR-013: the caller is about to replace this daemon. Record
+        // the in-flight set as abandoned while the store is still writable --
+        // the replacer cannot do it, because that set lives only in THIS
+        // daemon's memory. Does NOT shut anything down: the replacer still
+        // hard-kills, and a caller that never sends this simply gets today's
+        // behaviour.
+        IpcRequest::QuiesceForReplace => {
+            let recorded = state.record_abandoned_jobs();
+            IpcResult::Ok {
+                response: IpcResponse::QuiesceAck { recorded },
             }
         }
     };
@@ -1424,6 +1438,7 @@ mod tests {
                 seq: 0,
             }),
             IpcRequest::Shutdown,
+            IpcRequest::QuiesceForReplace,
         ]
     }
 
