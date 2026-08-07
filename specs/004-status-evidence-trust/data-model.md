@@ -102,7 +102,7 @@ Closed enum on the status response. Present on **every** response.
 | Field | Change |
 |---|---|
 | `frames_total`, `frames_stdout`, `frames_stderr`, `bytes_total`, `events_emitted` | **Unchanged types.** Remain bare `u64`. Optionality rejected — see R4. |
-| `restarted` | Retained, serde-defaulted, original meaning preserved. `true` iff `outcome_trust == reconstructed`. |
+| `restarted` | Retained, serde-defaulted, original meaning preserved. `true` iff `outcome_trust != observed` — i.e. `reconstructed` or `abandoned`, both read back from the receipt rather than witnessed live. |
 | `outcome_trust` | **New**, serde-defaulted to `observed` so older payloads decode unchanged. |
 
 ## State and provenance transitions

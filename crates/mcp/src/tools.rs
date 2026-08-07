@@ -1529,7 +1529,7 @@ impl TerminalCommanderMcpServer {
 
     /// `command_status` — lifecycle counters + exit info for a job.
     #[tool(
-        description = "Lookup bounded counters and exit info for a previously started job. `outcome_trust` tells you HOW the daemon knows: `observed` (witnessed live -- every counter is a real observation), `reconstructed` (read back from the durable receipt after a restart -- state/exit_code are truthful and the counters are the values captured when the job finished), `lost` (the daemon recorded this job starting and never recorded it finishing -- NEVER treat as success), `abandoned` (ended by daemon shutdown or replacement rather than by the job itself; reported as cancelled with no exit code, and is NOT a failure). `restarted` is the older boolean alias for 'not observed live'; prefer `outcome_trust`. Never returns raw stream text, with one exception: when the command finished and ZERO rules matched, a bounded exit receipt (exit code, suppressed-line count, short tail) is included so a no-rule command is never silent. That receipt is memory-only and does NOT survive a daemon restart -- its absence after a restart does not mean the command produced no output."
+        description = "Lookup bounded counters and exit info for a previously started job. `outcome_trust` tells you HOW the daemon knows: `observed` (witnessed live -- every counter is a real observation), `reconstructed` (read back from the durable receipt after a restart -- state/exit_code are truthful and the counters are the values captured when the job finished), `abandoned` (ended by daemon shutdown or replacement rather than by the job itself; reported as cancelled with no exit code, and is NOT a failure). A job the daemon recorded STARTING but never recorded finishing is not a status at all -- it is returned as a typed `JobLost` error, never as an `outcome_trust` value, and must NEVER be read as success. `restarted` is the older boolean alias for 'not observed live'; prefer `outcome_trust`. Never returns raw stream text, with one exception: when the command finished and ZERO rules matched, a bounded exit receipt (exit code, suppressed-line count, short tail) is included so a no-rule command is never silent. That receipt is memory-only and does NOT survive a daemon restart -- its absence after a restart does not mean the command produced no output."
     )]
     async fn command_status(
         &self,
@@ -4938,10 +4938,35 @@ fn command_status_payload(s: &CommandStatusResponse) -> serde_json::Value {
         // real counters. Only receipts written before that migration lack them.
         "restarted": s.restarted,
         // spec 004 FR-006: how the daemon knows. observed | reconstructed |
-        // lost | abandoned. Present on EVERY response so the normal and
-        // reconstructed shapes cannot drift apart.
-        "outcome_trust": s.outcome_trust,
+        // abandoned. Present on EVERY response so the normal and reconstructed
+        // shapes cannot drift apart. (`lost` is NOT a value here -- it is
+        // delivered as a typed `JobLost` error.)
+        "outcome_trust": effective_outcome_trust(s),
     })
+}
+
+/// Resolve `outcome_trust` against version skew (spec 004 review, kimi-k3).
+///
+/// `outcome_trust` is `#[serde(default)]` and its default is `Observed` -- the
+/// one value this feature exists to WITHHOLD when the daemon did not witness
+/// the outcome. Decoding an OLD daemon's restart-reconstructed reply (which
+/// carries `restarted: true` and no `outcome_trust` field) would therefore
+/// silently certify it as observed, during exactly the window in which old
+/// daemons produce reconstructed answers.
+///
+/// `restarted == true` with `Observed` is impossible from a current daemon --
+/// there `restarted` is DERIVED as `outcome_trust != Observed` -- so the
+/// combination is an unambiguous marker of a pre-004 peer, not a real state.
+/// Trust the explicit boolean over the defaulted enum.
+fn effective_outcome_trust(
+    s: &CommandStatusResponse,
+) -> terminal_commander_ipc::protocol::OutcomeTrust {
+    use terminal_commander_ipc::protocol::OutcomeTrust;
+    if s.restarted && s.outcome_trust == OutcomeTrust::Observed {
+        OutcomeTrust::Reconstructed
+    } else {
+        s.outcome_trust
+    }
 }
 
 fn command_output_tail_payload(r: &CommandOutputTailResponse) -> serde_json::Value {

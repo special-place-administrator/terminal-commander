@@ -38,7 +38,11 @@ older daemon decodes unchanged against the new struct.
   built against the current schema, in exactly the case the change would exist to
   serve. See research R4.
 - `restarted` keeps its type, its `#[serde(default)]`, and its meaning. It
-  becomes a derived alias: `restarted == (outcome_trust == Reconstructed)`.
+  becomes a derived alias for "this outcome was NOT observed live":
+  `restarted == (outcome_trust != Observed)`. It is therefore `true` for both
+  `reconstructed` and `abandoned` — both are read back from the durable
+  receipt rather than witnessed. Derived, never set independently, so the two
+  fields cannot drift.
 - `exit_code` stays truthful when recovered from the durable record. It is
   **not** forced to null on reconstruction (spec FR-008).
 

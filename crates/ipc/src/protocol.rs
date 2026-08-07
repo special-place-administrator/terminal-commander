@@ -114,6 +114,16 @@ pub struct CommandReceipt {
 /// the normal and degraded shapes cannot drift apart. Constitution VII requires
 /// public diagnostics to use closed typed codes rather than free text, which is
 /// why this is a fixed enum and not a note field.
+///
+/// ## "lost" is deliberately NOT a value here
+///
+/// A job the daemon recorded starting and never recorded finishing has no
+/// outcome to report, so it is not a status payload at all: it is delivered as
+/// a typed [`IpcErrorCode::JobLost`] error. An earlier draft carried a `Lost`
+/// variant and the agent-facing docs promised it as a field value, but nothing
+/// ever constructed it -- an agent branching on `outcome_trust == "lost"` would
+/// have waited forever for a value that could not arrive (found by all three
+/// reviewers of this branch). Every variant below has a live construction site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutcomeTrust {
@@ -126,9 +136,6 @@ pub enum OutcomeTrust {
     /// captured when the job finished. Receipts written before the evidence
     /// migration carry no counters, and that absence is reported honestly.
     Reconstructed,
-    /// The daemon durably recorded this job STARTING and never recorded it
-    /// finishing. Never a success.
-    Lost,
     /// Ended by daemon shutdown or stale replacement rather than reaching its
     /// own conclusion. Reported with lifecycle state `Cancelled` and no exit
     /// code -- deliberately NOT a failure, and deliberately not a new
