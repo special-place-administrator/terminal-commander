@@ -148,6 +148,44 @@ A well-formed but never-started id still returns `UnknownJob`
 Cleanup: the branch daemons spawned for this probe were killed; the three
 installed daemons were untouched.
 
+## Implementation review (three independent models)
+
+The branch was reviewed by Composer, Grok 4.5 and kimi-k3 against a written
+brief. All three returned **APPROVE WITH FIXES**. Every finding below was
+re-verified against source before being accepted; the fixes landed on this
+branch.
+
+Two BLOCKER-class defects were found, both in the same habit: receipts were
+persisted on the happy path and missed at the terminal-transition edges.
+
+| Finding | Composer | Grok | kimi-k3 | Resolution |
+|---|---|---|---|---|
+| PTY/watch stop → false `JobLost` | missed | BLOCKER | HIGH | fixed: both lanes persist a receipt; watch reap too |
+| Abandonment clobbers a real receipt | missed | wrong direction | HIGH | fixed: asymmetric store write |
+| `restarted` contradicts published contract | LOW | HIGH | — | fixed: docs corrected to match code |
+| `OutcomeTrust::Lost` dead, MCP promises it | MEDIUM | MEDIUM | LOW | fixed: variant removed, text corrected |
+| Restart test asserts no evidence | §6.3 | MEDIUM | — | fixed: cross-restart equality pinned |
+| `serde(default) = Observed` over-claims on skew | — | — | LOW | fixed: derived from `restarted` |
+| `Observed` on combed live-map miss | MEDIUM | LOW | LOW | latent only; gated by TCD-8, recorded |
+| `quiesce_for_replace` unauthenticated | — | — | LOW | accepted: matches the `Shutdown` precedent |
+
+Two notes worth keeping:
+
+- **The reviewers disagreed, and the disagreement was the signal.** Grok read
+  the abandonment race as "directionally safe — a real exit wins". It is not:
+  the scan decision is already stale when it lands, so the abandonment can be
+  the later write. kimi-k3 traced the ordering correctly. Had all three agreed
+  with Grok, a data-destroying defect would have shipped.
+- **The fix for that race is at the storage layer, not the caller.** Writers
+  cannot guarantee ordering here — PTY waiters are undrained and quiesce runs
+  on a live daemon — so `record_job_receipt` now enforces the invariant
+  itself: real always wins, abandonment never overwrites a real row.
+
+Falsification results were unanimous (6/6 CONFIRMED) except claim 4
+("reconstruction carries the evidence a live observer had"), which Grok rated
+**UNRESOLVED as automated proof** — correctly, since only manual dogfood
+covered the cross-restart case. That is now pinned in CI.
+
 ## Source-status notes
 
 | Behavior | Status | Note |
