@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.1.87](https://github.com/special-place-ai-heaven/terminal-commander/compare/v0.1.86...v0.1.87) (2026-08-07)
+
+
+### Features
+
+* **daemon:** lost detection distinguishes a started job from an unknown id ([9310a83](https://github.com/special-place-ai-heaven/terminal-commander/commit/9310a8373b69e70213728d7cf056e2b4c5c2a85f))
+* **daemon:** move reconstruction into the engine and pin evidence equality ([9310a83](https://github.com/special-place-ai-heaven/terminal-commander/commit/9310a8373b69e70213728d7cf056e2b4c5c2a85f))
+* **daemon:** record abandonment for jobs still in flight at shutdown ([9310a83](https://github.com/special-place-ai-heaven/terminal-commander/commit/9310a8373b69e70213728d7cf056e2b4c5c2a85f))
+* **ipc:** outcome_trust taxonomy and evidence-backed reconstruction ([9310a83](https://github.com/special-place-ai-heaven/terminal-commander/commit/9310a8373b69e70213728d7cf056e2b4c5c2a85f))
+* **pty:** persist a job receipt with real evidence on PTY exit ([9310a83](https://github.com/special-place-ai-heaven/terminal-commander/commit/9310a8373b69e70213728d7cf056e2b4c5c2a85f))
+* **store:** V0008 outcome evidence and the event-count conjunction fix ([9310a83](https://github.com/special-place-ai-heaven/terminal-commander/commit/9310a8373b69e70213728d7cf056e2b4c5c2a85f))
+* **supervisor:** quiesce a stale daemon before replacing it ([9310a83](https://github.com/special-place-ai-heaven/terminal-commander/commit/9310a8373b69e70213728d7cf056e2b4c5c2a85f))
+
+
+### Bug Fixes
+
+* **contract:** remove the dead lost variant, reconcile restarted, close the skew hole ([9310a83](https://github.com/special-place-ai-heaven/terminal-commander/commit/9310a8373b69e70213728d7cf056e2b4c5c2a85f))
+* **daemon:** decline unobserved zeros; execute the quiesce fallback; retract a false backlog claim ([9310a83](https://github.com/special-place-ai-heaven/terminal-commander/commit/9310a8373b69e70213728d7cf056e2b4c5c2a85f))
+* **daemon:** route command_status to the lane that owns the job ([9310a83](https://github.com/special-place-ai-heaven/terminal-commander/commit/9310a8373b69e70213728d7cf056e2b4c5c2a85f))
+* **daemon:** stop paths persist receipts; abandonment can never clobber a real one ([9310a83](https://github.com/special-place-ai-heaven/terminal-commander/commit/9310a8373b69e70213728d7cf056e2b4c5c2a85f))
+
 ## [0.1.86](https://github.com/special-place-ai-heaven/terminal-commander/compare/v0.1.85...v0.1.86) (2026-07-17)
 
 
