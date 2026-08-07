@@ -13,7 +13,7 @@
 
 ## Requirement Completeness
 
-- [ ] No [NEEDS CLARIFICATION] markers remain
+- [x] No [NEEDS CLARIFICATION] markers remain
 - [x] Requirements are testable and unambiguous
 - [x] Success criteria are measurable
 - [x] Success criteria are technology-agnostic (no implementation details)
@@ -31,29 +31,35 @@
 
 ## Notes
 
-**Validation iteration 1 — one item fails, deliberately.**
+**Iteration 1** — one item failed: two `[NEEDS CLARIFICATION]` markers remained
+(abandonment representation, durable retention of the raw output tail). Both met
+the "no reasonable default exists" bar and were routed to `/speckit-clarify`
+rather than guessed.
 
-Two `[NEEDS CLARIFICATION]` markers remain, both under the three-marker cap and
-both meeting the bar for "no reasonable default exists":
+**Iteration 2 — all items pass.** Both questions were answered by the operator
+and are now recorded as binding decisions D1 and D2 in the spec's Resolved
+Decisions section:
 
-1. **Abandonment representation.** Introducing a new lifecycle state versus
-   carrying abandonment as a separate attribute is a vocabulary decision that
-   touches every lane. Choosing unilaterally would either expand core scope or
-   pre-commit against guidance already recorded in the source audit. Adversarial
-   review established that getting this wrong manufactures a false negative of
-   exactly the class this feature removes, so it cannot be defaulted.
-2. **Durable retention of the raw output tail.** Constitution III sanctions the
-   bounded tail on the wire and is silent on persisting it. This is a governance
-   question reserved to the operator, not an engineering default.
+- **D1**: abandonment is carried by the trust indicator; the lifecycle state
+  remains the truthful "cancelled". Fully additive; avoids the coerce-to-failed
+  trap adversarial review identified.
+- **D2**: the bounded no-silence tail is **not** persisted. Recorded explicitly
+  as a governance exclusion rather than a convenience deferral — the capability
+  is declined on principle. Evidence supports it: the tail was null even live in
+  both reported incidents, so persisting it would not have prevented the loss.
 
-Both are routed to `/speckit-clarify` rather than guessed. No other item fails.
+Spec updated accordingly: User Story 1 scenario 3 now requires that a missing
+tail be *explicit* rather than silently reading as "no output"; FR-006 carries
+four trust values; FR-014 binds abandonment to the indicator, not a new state.
 
 **Content-quality note.** Two `docs/` paths appear in the Context section as
-provenance for the analysis. These are references to prior findings, not
-implementation direction, and no requirement, scenario, or success criterion
-names a file, type, function, or technology.
+provenance for the prior analysis. These are references to findings, not
+implementation direction; no requirement, scenario, or success criterion names a
+file, type, function, or technology.
 
 **Scope note.** The specification deliberately covers all lanes and both delivery
 modes rather than the combed lane alone. An earlier draft plan scoped the read
 path narrowly; that narrowing was withdrawn because it was a convenience
-deferral, and FR-004, FR-005, FR-010 and FR-015 now bind the wider scope.
+deferral. FR-004, FR-005, FR-010 and FR-015 now bind the wider scope.
+
+**Ready for `/speckit-plan`.**

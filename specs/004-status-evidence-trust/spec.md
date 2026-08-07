@@ -54,9 +54,10 @@ evidence as the first.
 2. **Given** that same reconstructed response, **When** an agent inspects it,
    **Then** the response states plainly that it was reconstructed from durable
    storage rather than observed live.
-3. **Given** a command that produced no rule matches, **When** its status is
-   polled after a restart, **Then** the bounded no-silence tail is still
-   available.
+3. **Given** a command that produced no rule matches and whose bounded tail was
+   therefore its only output evidence, **When** its status is polled after a
+   restart, **Then** the response makes clear the tail was not retained — it
+   MUST NOT read as though the command produced no output.
 
 ---
 
@@ -217,7 +218,7 @@ surface and confirm answers match.
   duration MUST remain readable after this change; no currently readable outcome
   may become unreadable.
 - **FR-006**: Every status response MUST carry a single explicit indicator of how
-  the outcome was established: observed, reconstructed, or lost.
+  the outcome was established: observed, reconstructed, lost, or abandoned.
 - **FR-007**: The previously shipped restart marker MUST continue to decode and
   retain its meaning for existing consumers; the change MUST be additive.
 - **FR-008**: A truthful exit code recovered from durable storage MUST be
@@ -235,8 +236,10 @@ surface and confirm answers match.
   engine MUST be given a bounded opportunity to record its unfinished jobs as
   abandoned; failure to do so MUST fall back to current behaviour, not block the
   replacement.
-- **FR-014**: An abandoned outcome MUST be reported as abandoned and MUST NOT be
-  reported as a failure or a success.
+- **FR-014**: An abandoned outcome MUST be reported through the trust indicator,
+  MUST NOT be reported as a failure or a success, and MUST NOT require a new
+  lifecycle state. The lifecycle state remains the truthful "cancelled" — the job
+  was terminated — while the trust indicator carries the cause.
 - **FR-015**: The reconstruction capability MUST be reachable through the engine's
   own typed interface, so both delivery modes behave identically.
 - **FR-016**: The agent-facing description of the status operation MUST document
@@ -253,9 +256,11 @@ surface and confirm answers match.
   hold the evidence a live observer would have had.
 - **Job Start Record**: The durable record that a job began. Already written for
   every lane; currently unused for diagnosis.
-- **Trust Indicator**: How the reported outcome was established.
+- **Trust Indicator**: How the reported outcome was established — observed,
+  reconstructed, lost, or abandoned. The single field an agent branches on.
 - **Abandonment Record**: A durable statement that a job was terminated by engine
-  shutdown or replacement rather than reaching its own conclusion.
+  shutdown or replacement rather than reaching its own conclusion. Recorded as a
+  cause on the outcome record, not as a new lifecycle state.
 
 ## Success Criteria *(mandatory)*
 
@@ -300,20 +305,45 @@ surface and confirm answers match.
 - The reported incident's trigger — replacing a version-stale engine while work
   is in flight — is the specific sequence Story 5 must cover.
 
-## Outstanding Clarifications
+## Resolved Decisions
 
-- **[NEEDS CLARIFICATION: abandonment representation]** An abandoned outcome has
-  no home in the current lifecycle vocabulary, and an unrecognised label is
-  currently coerced into "failed" — which would manufacture exactly the false
-  negative this feature exists to remove. Options: introduce abandonment as a
-  first-class lifecycle state, or carry it as a separate attribute alongside the
-  existing states. This determines whether Story 5 is additive or touches a core
-  vocabulary shared by every lane.
+Both open questions were put to the operator during `/speckit-clarify` and are
+now binding. Neither had a reasonable default; both were resolved deliberately
+rather than guessed.
 
-- **[NEEDS CLARIFICATION: durable retention of raw output tail]** Story 1's third
-  acceptance scenario requires the bounded no-silence tail to survive a restart,
-  which extends the lifetime of raw captured output from memory into durable
-  storage. Constitution III sanctions that tail on the wire but is silent on
-  persisting it. Options: persist it, persist it with redaction, or drop that
-  scenario and keep the tail memory-only. This is a governance decision, not a
-  technical one.
+### D1 — Abandonment is carried by the trust indicator, not a new lifecycle state
+
+**Decision**: the lifecycle state of an abandoned job remains "cancelled", which
+is truthful — the job was terminated rather than reaching its own conclusion —
+and the trust indicator carries `abandoned` as the cause.
+
+**Rationale**: fully additive. The core lifecycle vocabulary is shared by every
+lane and threaded through exhaustive matches; adding a variant would widen scope
+far beyond this feature and risk decode failures in older consumers. This also
+honours the source audit's own guidance that "the daemon lost the thread" is not
+a job lifecycle state. Critically, it avoids the trap adversarial review
+identified: an unrecognised terminal label is currently coerced to "failed",
+which would have manufactured exactly the false negative this feature exists to
+remove.
+
+**Binds**: FR-006, FR-014, User Story 5.
+
+### D2 — The bounded no-silence tail is NOT persisted
+
+**Decision**: the tail remains memory-only. It does not survive a restart. The
+response must instead make its absence explicit, so a missing tail never reads as
+"this command produced no output".
+
+**Rationale**: a governance decision, not an engineering one. Constitution III
+sanctions the bounded tail *on the wire*; persisting raw captured frames to disk
+extends its lifetime into storage and is a posture change for a default-deny
+product. The evidence also shows it would not have helped: in **both** reported
+incidents the tail was null even live, because 115 rule-driven events meant the
+zero-rule carve-out never applied. Counters and duration — not the tail — are
+what recover the lost 40 minutes.
+
+**Scope effect**: this removes durable-tail persistence from the feature. It is
+recorded here as a deliberate governance exclusion, **not** a convenience
+deferral — the capability is declined on principle, not postponed to save work.
+
+**Binds**: FR-001, User Story 1 acceptance scenario 3.
