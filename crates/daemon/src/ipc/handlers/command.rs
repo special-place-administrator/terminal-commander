@@ -247,3 +247,82 @@ pub(in crate::ipc::server) fn handle_command_output_tail(
         evicted_frames: tail.evicted_frames,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use terminal_commander_core::JobId;
+    use terminal_commander_store::AuditEntry;
+
+    use super::{CommandStatusParams, IpcErrorCode, handle_command_status};
+    use crate::audit::AuditSink;
+    use crate::config::DaemonConfig;
+    use crate::state::DaemonState;
+
+    fn tmp_data_dir(tag: &str) -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut p = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        p.push(format!(
+            "tc-joblost-{tag}-{}-{nanos}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        p
+    }
+
+    /// spec 004 FR-009: a job the daemon durably recorded STARTING, with no
+    /// receipt, is LOST -- a diagnosis, not "never heard of it".
+    ///
+    /// This is the wire-level half of the guarantee; the discrimination logic
+    /// itself is covered in `tests/status_lost_detection.rs`.
+    #[test]
+    fn a_started_job_with_no_receipt_reports_job_lost() {
+        let data = tmp_data_dir("lost");
+        let state = std::sync::Arc::new(
+            DaemonState::bootstrap(DaemonConfig::defaults_in(&data)).expect("bootstrap"),
+        );
+
+        let job_id = JobId::new();
+        state
+            .audit
+            .emit(&AuditEntry::new(
+                "command_start",
+                job_id.to_wire_string(),
+                "allow",
+            ))
+            .expect("audit emit");
+
+        let err = handle_command_status(&state, &CommandStatusParams { job_id })
+            .expect_err("a lost job must not return a status");
+        assert_eq!(
+            err.code,
+            IpcErrorCode::JobLost,
+            "a started-but-unfinished job is LOST, not unknown"
+        );
+
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// An identifier with no durable trace at all stays `UnknownJob`. The lost
+    /// case must NARROW that error, not swallow it.
+    #[test]
+    fn an_identifier_with_no_trace_reports_unknown_job() {
+        let data = tmp_data_dir("unknown");
+        let state = std::sync::Arc::new(
+            DaemonState::bootstrap(DaemonConfig::defaults_in(&data)).expect("bootstrap"),
+        );
+
+        let err = handle_command_status(
+            &state,
+            &CommandStatusParams {
+                job_id: JobId::new(),
+            },
+        )
+        .expect_err("an unknown id must not return a status");
+        assert_eq!(err.code, IpcErrorCode::UnknownJob);
+
+        let _ = std::fs::remove_dir_all(&data);
+    }
+}

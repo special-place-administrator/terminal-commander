@@ -165,3 +165,47 @@ fn a_denied_or_failed_start_does_not_read_as_a_lost_job() {
 
     cleanup(&data);
 }
+
+/// spec 004 US4 acceptance 3 / T2: a job killed mid-run can NEVER read as a
+/// successful terminal outcome.
+///
+/// The chain has two links, and this test pins the first:
+///   1. a non-terminal job has NO receipt (here), and
+///   2. a start record with no receipt classifies as lost, never as a terminal
+///      (`a_really_started_job_is_detected_via_the_production_audit_row` plus
+///      the wire-level assertions in `ipc::handlers::command`).
+///
+/// Together they mean an abruptly-killed daemon cannot leave behind anything a
+/// later status read could mistake for success -- there is simply no receipt to
+/// reconstruct from. Structurally this holds because `drive_to_exit` only
+/// yields `Exited` AFTER `probe.wait()` reaps the child, and both persist sites
+/// sit after that reap.
+///
+/// Deterministic by construction: no real process is killed, so there is no
+/// race to lose.
+#[test]
+fn a_non_terminal_job_has_no_receipt_to_reconstruct_from() {
+    let data = tmp_data_dir("running");
+    let state = DaemonState::bootstrap(DaemonConfig::defaults_in(&data)).unwrap();
+
+    let job_id = terminal_commander_core::JobId::new();
+    state.jobs.start(terminal_commander_core::JobConfig {
+        job_id,
+        argv: vec!["still-running".to_owned()],
+        bucket_id: terminal_commander_core::BucketId::new(),
+        probe_id: terminal_commander_core::ProbeId::new(),
+        source_type: terminal_commander_core::SourceType::Process,
+        grace_secs: 0,
+    });
+    state.jobs.mark_running(job_id);
+
+    assert!(
+        state.command.reconstructed_status(job_id).is_none(),
+        "a job that has not reached a terminal transition MUST have no receipt; \
+         if one existed, an abrupt daemon death could surface it as a completed \
+         outcome"
+    );
+
+    let _ = &state;
+    cleanup(&data);
+}
