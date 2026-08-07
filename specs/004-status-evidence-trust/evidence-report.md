@@ -95,10 +95,41 @@ Same job: status claimed zero frames and zero bytes while the tail returned the
 actual output line. `status_lane_ownership.rs` makes that combination
 unreachable.
 
-**UNVERIFIED (stated reason):** the post-fix live probe was not re-run against a
-rebuilt installed daemon — the branch is unpushed and the installed `0.1.86`
-binary is the pre-fix build. Re-run after merge to capture the post-fix
-transcript.
+**VERIFIED post-fix (2026-08-07).** Re-run end-to-end through the real MCP stdio
+adapter against a daemon built from this branch, on the same host, same command:
+
+```text
+pty_command_start ["hostname"] -> job_019fdbaf…4d1d
+command_status                 -> state exited, exit_code 0, outcome_trust "observed",
+                                  restarted false, frames_total 1, bytes_total 93,
+                                  duration_ms 798
+command_output_tail            -> lines ["CRRR65734"], returned_lines 1
+```
+
+Status and tail now agree. Pre-fix the same call reported `frames_total: 0`,
+`bytes_total: 0` beside a tail holding the line.
+
+Then the headline case — the daemon was hard-killed (`taskkill /F`, so the
+in-memory job map is lost exactly as in the incident) and a cold adapter
+re-bootstrapped a fresh daemon on the same data dir:
+
+```text
+command_status (same job) -> state exited, exit_code 0,
+                             outcome_trust "reconstructed", restarted true,
+                             frames_total 1, bytes_total 93, duration_ms 798,
+                             probe_id prb_019fdbaf…e762
+```
+
+The evidence survived the restart **and matches the live observation exactly**
+(1 / 93 / 798) — the R1 conjunction invariant holding in production, not only in
+tests. Pre-fix this returned zeros and a null duration, which is what caused the
+reporting session to discard a passing suite.
+
+A well-formed but never-started id still returns `UnknownJob`
+(`ipc_code: "UnknownJob"`), confirming it stays distinct from `JobLost`.
+
+Cleanup: the branch daemons spawned for this probe were killed; the three
+installed daemons were untouched.
 
 ## Source-status notes
 
