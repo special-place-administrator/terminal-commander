@@ -446,6 +446,10 @@ impl StoreClient {
     /// `metrics_json` carries the evidence a live observer would have had.
     /// It MUST be numeric and identifier data only -- constitution III bars
     /// raw frames from persistent output.
+    // Mirrors `EventStore::record_job_receipt`'s flat row shape one-for-one;
+    // the `StoreOp` it builds uses NAMED fields, so the actor path itself
+    // cannot transpose arguments.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_job_receipt(
         &self,
         job_id: &str,

@@ -128,6 +128,13 @@ impl EventStore {
     /// `metrics_json` MUST contain only numeric and identifier evidence. Frame
     /// text is forbidden here by constitution III (no raw frames in persistent
     /// output); the caller is responsible for honouring that.
+    // Eight positional parameters, one over the clippy default. Grouping them
+    // into a params struct was considered and rejected: the receipt fields are
+    // a flat, stable row shape, and the two adjacent `Option<&str>` arguments
+    // are pinned by round-trip tests below (a swap fails
+    // `abandoned_end_cause_round_trips_without_an_exit_code`). Matches the
+    // existing repo convention for wide-but-flat signatures.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_job_receipt(
         &mut self,
         job_id: &str,

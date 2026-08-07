@@ -184,18 +184,24 @@ pub(in crate::ipc::server) fn handle_command_status(
     }
 }
 
-/// TC-B3: reconstruct a restart-marked terminal [`CommandStatusResponse`]
-/// from a persisted job receipt, or `None` if no receipt exists (then the
-/// caller returns the original `UnknownJob` error). Stamps the receipt's
-/// restart marker as a side effect so the persisted row records that it was
-/// read post-restart. The live counters are zero (the in-memory probe
-/// metrics did not survive the restart); `restarted: true` tells the agent
-/// the terminal `state`/`exit_code` are authoritative-from-disk.
+/// TC-B3 / spec 004: reconstruct a terminal [`CommandStatusResponse`] from a
+/// persisted job receipt, or `None` if no receipt exists (then the caller
+/// decides between `JobLost` and `UnknownJob`). Stamps the receipt's restart
+/// marker as a side effect so the persisted row records that it was read
+/// post-restart.
+///
+/// Counters come from the evidence captured at the terminal transition, so a
+/// reconstructed pass is USABLE rather than merely labelled -- that gap is what
+/// caused a reporting session to discard two passing suites and re-run them.
+/// Receipts written before the evidence migration carry none, and that absence
+/// is reported as-is rather than being disguised.
 fn restart_marked_status_from_receipt(
     state: &Arc<DaemonState>,
     job_id: terminal_commander_core::JobId,
 ) -> Option<crate::ipc::protocol::CommandStatusResponse> {
     use terminal_commander_core::{BucketId, JobState, ProbeId};
+
+    use crate::ipc::protocol::OutcomeTrust;
 
     let wire = job_id.to_wire_string();
     let row = state.store.get_job_receipt(&wire).ok().flatten()?;
@@ -217,32 +223,67 @@ fn restart_marked_status_from_receipt(
         .and_then(|v| v.get("events_emitted").and_then(serde_json::Value::as_u64))
         .unwrap_or(0);
 
+    // spec 004 FR-002: the evidence a live observer would have had. `None` for
+    // pre-migration rows; those report zero counters, which the agent-facing
+    // contract explicitly covers.
+    let evidence = row
+        .metrics_json
+        .as_deref()
+        .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok());
+    let num = |key: &str| -> u64 {
+        evidence
+            .as_ref()
+            .and_then(|v| v.get(key).and_then(serde_json::Value::as_u64))
+            .unwrap_or(0)
+    };
+    let duration_ms = evidence
+        .as_ref()
+        .and_then(|v| v.get("duration_ms").and_then(serde_json::Value::as_u64));
+    let probe_id = evidence
+        .as_ref()
+        .and_then(|v| v.get("probe_id").and_then(serde_json::Value::as_str))
+        .and_then(|s| ProbeId::parse_wire(s).ok())
+        .unwrap_or_default();
+
+    // spec 004 D1: abandonment rides the trust indicator. The terminal state
+    // stays the truthful `Cancelled` and the exit code stays absent -- an
+    // abandoned job did not fail, and reporting it as a failure would be the
+    // exact false negative this feature exists to remove.
+    let abandoned = row.end_cause.as_deref() == Some("abandoned");
+    let (state_enum, exit_code, outcome_trust) = if abandoned {
+        (JobState::Cancelled, None, OutcomeTrust::Abandoned)
+    } else {
+        (state_enum, row.exit_code, OutcomeTrust::Reconstructed)
+    };
+
     // Best-effort: stamp the restart marker on the durable row. A failure
-    // here does not change the response we return (it already carries
-    // `restarted: true`).
+    // here does not change the response we return.
     let _ = state.store.mark_job_receipt_restarted(&wire);
 
     Some(crate::ipc::protocol::CommandStatusResponse {
         job_id,
         bucket_id,
-        // The probe is gone post-restart; a fresh id is a truthful "no live
-        // probe" placeholder (context/tail reads will report not-found).
-        probe_id: ProbeId::default(),
+        probe_id,
         state: state_enum,
-        frames_total: 0,
-        frames_stdout: 0,
-        frames_stderr: 0,
-        bytes_total: 0,
+        frames_total: num("frames_total"),
+        frames_stdout: num("frames_stdout"),
+        frames_stderr: num("frames_stderr"),
+        bytes_total: num("bytes_total"),
         events_emitted,
-        frames_suppressed: 0,
-        frames_suppressed_progress: 0,
-        frames_suppressed_dedupe: 0,
-        exit_code: row.exit_code,
+        frames_suppressed: num("frames_suppressed"),
+        frames_suppressed_progress: num("frames_suppressed_progress"),
+        frames_suppressed_dedupe: num("frames_suppressed_dedupe"),
+        exit_code,
         signal: None,
-        duration_ms: None,
-        // The no-silence frame tail did not survive the restart.
+        duration_ms,
+        // The no-silence frame tail is memory-only by design (spec D2:
+        // constitution III bars raw frames from persistent output). Its absence
+        // here does NOT mean the command produced no output.
         receipt: None,
-        restarted: true,
+        // Derived, never set independently: true whenever the outcome was not
+        // observed live.
+        restarted: outcome_trust != OutcomeTrust::Observed,
+        outcome_trust,
     })
 }
 

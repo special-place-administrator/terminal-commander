@@ -3373,6 +3373,10 @@ pub fn into_mcp_error_for(request_is_idempotent: bool, e: &IpcError) -> McpError
         // which would train it to abandon TC for raw shell.
         | IpcErrorCode::ProgramNotFound
         | IpcErrorCode::UnknownJob
+        // spec 004: the daemon recorded this job STARTING but never recorded it
+        // finishing. Caller-routable, not a server fault: the agent should
+        // re-run rather than keep polling, and must NOT read it as success.
+        | IpcErrorCode::JobLost
         | IpcErrorCode::RuleNotFound
         | IpcErrorCode::RuleInvalid
         | IpcErrorCode::ScopeInvalid
@@ -4911,11 +4915,17 @@ fn command_status_payload(s: &CommandStatusResponse) -> serde_json::Value {
         // No-silence receipt (TCE-ERG-1): null unless the command
         // finished with zero rule-driven events.
         "receipt": s.receipt,
-        // TC-B3 (FR-027): true when this terminal result was reconstructed
-        // from a persisted receipt after a daemon restart (the in-memory job
-        // was gone). The state/exit_code are authoritative-from-disk; the
-        // live counters are zero. An honest terminal result, never an error.
+        // TC-B3 (FR-027): backward-compatible alias meaning "this outcome was
+        // NOT observed live". Prefer `outcome_trust`, which distinguishes the
+        // reasons. Corrected in spec 004: the earlier claim here that "the live
+        // counters are zero" is no longer true -- the evidence a live observer
+        // would have had is now persisted, so a reconstructed status carries
+        // real counters. Only receipts written before that migration lack them.
         "restarted": s.restarted,
+        // spec 004 FR-006: how the daemon knows. observed | reconstructed |
+        // lost | abandoned. Present on EVERY response so the normal and
+        // reconstructed shapes cannot drift apart.
+        "outcome_trust": s.outcome_trust,
     })
 }
 
@@ -7354,6 +7364,7 @@ mod tests {
             IpcErrorCode::ArgvInvalid,
             IpcErrorCode::ProgramNotFound,
             IpcErrorCode::UnknownJob,
+            IpcErrorCode::JobLost,
             IpcErrorCode::RuleNotFound,
             IpcErrorCode::RuleInvalid,
             IpcErrorCode::ScopeInvalid,

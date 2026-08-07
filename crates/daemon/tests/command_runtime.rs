@@ -862,6 +862,7 @@ fn response_types_have_no_raw_stream_lane() {
         duration_ms: Some(0),
         receipt: None,
         restarted: false,
+        outcome_trust: terminal_commanderd::OutcomeTrust::Observed,
     };
     assert_small_response(&s);
 }

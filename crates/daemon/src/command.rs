@@ -387,7 +387,7 @@ pub struct CommandStartRequest {
 // re-import, and the crate-root `pub use command::{...}` surface stays
 // stable.
 pub use terminal_commander_ipc::protocol::{
-    CommandReceipt, CommandStartResponse, CommandStatusResponse,
+    CommandReceipt, CommandStartResponse, CommandStatusResponse, OutcomeTrust,
 };
 
 /// EventSink that forwards drafts to the wired `Router`.
@@ -1904,6 +1904,9 @@ impl CommandRuntime {
             // TC-B3: the live in-memory path is never a restart-reconstructed
             // result; the persisted-receipt fallback sets this in the handler.
             restarted: false,
+            // spec 004: this counter set came from a live probe, so the agent
+            // may treat every number here as a real observation.
+            outcome_trust: OutcomeTrust::Observed,
         })
     }
 
@@ -1998,6 +2001,7 @@ fn evidence_json(
 /// `end_cause` is `Some("abandoned")` only when the job was ended by daemon
 /// shutdown or stale replacement rather than reaching its own conclusion. The
 /// terminal state stays the truthful `cancelled` (spec decision D1).
+#[allow(clippy::too_many_arguments)]
 fn persist_job_receipt(
     store: &StoreClient,
     job_id: JobId,
