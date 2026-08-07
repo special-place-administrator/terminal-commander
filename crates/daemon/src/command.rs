@@ -1888,19 +1888,36 @@ impl CommandRuntime {
             return Err(CommandError::UnknownJob(job_id));
         }
         let exited = rec.exit_info.is_some();
-        let (metrics, receipt) = self
-            .live
-            .read()
-            .get(&job_id)
-            .map(|b| {
-                let m = if exited {
-                    b.metrics.clone()
-                } else {
-                    b.metrics_live.lock().clone()
-                };
-                (m, b.receipt.clone())
-            })
-            .unwrap_or_default();
+        let live_metrics = self.live.read().get(&job_id).map(|b| {
+            let m = if exited {
+                b.metrics.clone()
+            } else {
+                b.metrics_live.lock().clone()
+            };
+            (m, b.receipt.clone())
+        });
+        // spec 004 review (composer MEDIUM, grok/kimi LOW): with no live
+        // binding there is NO observation to report, so certifying
+        // `unwrap_or_default()` zeros as `Observed` would be the precise
+        // over-claim this feature exists to delete. Decline instead and let
+        // the caller reconstruct from the durable receipt.
+        //
+        // The one exception is the documented start window: between the ledger
+        // registration and the live-map insert in `start_combed_inner` a job
+        // legitimately has no binding yet, and its zeros are TRUE -- nothing
+        // has happened. Declining there would report a starting job as
+        // unknown, so `Starting` keeps answering.
+        //
+        // Unreachable today because terminal bindings are never evicted
+        // (BACKLOG TCD-8); this is the guard that keeps TCD-8's eventual fix
+        // from silently reintroducing the defect.
+        let (metrics, receipt) = match live_metrics {
+            Some(found) => found,
+            None if rec.state == terminal_commander_core::JobState::Starting => {
+                (ProcessProbeMetrics::default(), None)
+            }
+            None => return Err(CommandError::UnknownJob(job_id)),
+        };
         Ok(CommandStatusResponse {
             job_id,
             bucket_id: rec.config.bucket_id,

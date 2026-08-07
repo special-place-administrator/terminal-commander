@@ -984,4 +984,104 @@ mod tests {
             "an error with no OS code must NOT classify as busy"
         );
     }
+
+    /// spec 004 review: "quiescing can never block a replacement" was argued
+    /// from construction (a 500 ms wrapper and a `_ => {}` arm) and all three
+    /// reviewers accepted it as CONFIRMED-by-trace while flagging the absent
+    /// test. These execute it.
+    ///
+    /// `quiesce_handshake` is generic over the stream, so a `duplex` pair
+    /// stands in for a peer on every platform -- no socket, no second daemon
+    /// binary, and no reliance on the reviewer's reading of the old daemon's
+    /// dispatch.
+    mod quiesce_fallback {
+        use super::*;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        /// Read the request frame a probe writes, then reply with `body`.
+        async fn reply_with(mut server: tokio::io::DuplexStream, body: &'static [u8]) {
+            let mut len = [0_u8; 4];
+            if server.read_exact(&mut len).await.is_err() {
+                return;
+            }
+            let n = u32::from_be_bytes(len) as usize;
+            let mut req = vec![0_u8; n];
+            if server.read_exact(&mut req).await.is_err() {
+                return;
+            }
+            let out_len = u32::try_from(body.len()).expect("small frame");
+            let _ = server.write_all(&out_len.to_be_bytes()).await;
+            let _ = server.write_all(body).await;
+        }
+
+        #[tokio::test]
+        async fn a_well_formed_ack_yields_the_recorded_count() {
+            let (client, server) = tokio::io::duplex(4096);
+            tokio::spawn(reply_with(
+                server,
+                br#"{"result":{"kind":"ok","response":{"method":"quiesce_ack","recorded":3}}}"#,
+            ));
+            assert_eq!(
+                quiesce_handshake(client).await,
+                Some(3),
+                "a current daemon's ack must surface its abandoned count"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_peer_that_rejects_the_verb_falls_through_instead_of_erroring() {
+            // A pre-004 daemon does not know `quiesce_for_replace` and answers
+            // with an error envelope. That MUST read as "no answer" so the
+            // caller proceeds to the kill, never as a failure that could stall
+            // or abort the replacement.
+            let (client, server) = tokio::io::duplex(4096);
+            tokio::spawn(reply_with(
+                server,
+                br#"{"result":{"kind":"err","code":"unknown_method"}}"#,
+            ));
+            assert_eq!(
+                quiesce_handshake(client).await,
+                None,
+                "an old daemon's rejection must fall through to the kill path"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_peer_that_answers_something_else_is_not_mistaken_for_an_ack() {
+            let (client, server) = tokio::io::duplex(4096);
+            tokio::spawn(reply_with(
+                server,
+                br#"{"result":{"kind":"ok","response":{"method":"health","uptime_secs":5}}}"#,
+            ));
+            assert_eq!(quiesce_handshake(client).await, None);
+        }
+
+        #[tokio::test]
+        async fn a_silent_peer_cannot_hang_the_replacement() {
+            // The failure that would actually hurt: a peer that accepts the
+            // connection and never replies. The handshake itself has no
+            // deadline by design -- the caller owns it -- so this pins that the
+            // caller's bound is what stops it.
+            let (client, _server) = tokio::io::duplex(4096);
+            let started = std::time::Instant::now();
+            let out = tokio::time::timeout(PROBE_TIMEOUT, quiesce_handshake(client)).await;
+            assert!(out.is_err(), "a silent peer must not resolve to an answer");
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "the replacement must not wait on a silent daemon; took {:?}",
+                started.elapsed()
+            );
+        }
+
+        #[tokio::test]
+        async fn the_replacement_deadline_stays_short() {
+            // `replace_if_stale` calls quiesce BEFORE hard_kill on every
+            // adapter start, so this bound is paid on every upgrade. If it
+            // grows, that cost is silently added to every replacement.
+            assert!(
+                PROBE_TIMEOUT <= Duration::from_millis(500),
+                "quiesce is on the replacement hot path; PROBE_TIMEOUT is {PROBE_TIMEOUT:?}"
+            );
+        }
+    }
 }

@@ -153,3 +153,64 @@ fn unknown_id_is_still_unknown_in_every_lane() {
 
     cleanup(&data);
 }
+
+/// Register a COMBED-lane job in the shared ledger with no live binding, which
+/// is what a future `CommandRuntime.live` eviction (BACKLOG TCD-8) will
+/// produce for a finished job.
+fn register_combed_job_without_binding(state: &DaemonState) -> JobId {
+    let job_id = JobId::new();
+    state.jobs.start(JobConfig {
+        job_id,
+        argv: vec!["evicted".to_owned()],
+        bucket_id: BucketId::new(),
+        probe_id: ProbeId::new(),
+        source_type: SourceType::Process,
+        grace_secs: 0,
+    });
+    job_id
+}
+
+#[test]
+fn a_combed_job_with_no_live_binding_is_declined_not_certified_observed() {
+    // spec 004 review (composer MEDIUM, grok/kimi LOW). The combed lane used
+    // `unwrap_or_default()` on a live-map miss and then stamped
+    // `outcome_trust: Observed` -- certifying zeros nobody witnessed, which is
+    // the exact over-claim this feature exists to delete.
+    //
+    // Unreachable while TCD-8 keeps terminal bindings forever. This is the
+    // guard that stops TCD-8's eventual fix from silently reintroducing it.
+    let data = tmp_data_dir("evicted-binding");
+    let state = DaemonState::bootstrap(DaemonConfig::defaults_in(&data)).unwrap();
+
+    let job_id = register_combed_job_without_binding(&state);
+    state.jobs.mark_running(job_id);
+
+    assert!(
+        state.command.status(job_id).is_err(),
+        "with no live binding there is no observation; the lane must decline \
+         so the caller reconstructs from the receipt, never certify zeroes"
+    );
+
+    cleanup(&data);
+}
+
+#[test]
+fn the_start_window_still_answers_while_the_binding_is_being_inserted() {
+    // The decline above must NOT swallow the documented window between ledger
+    // registration and live-map insertion in `start_combed_inner`. A job that
+    // has genuinely just started has truthful zeroes, and reporting it as
+    // unknown would be a regression of its own.
+    let data = tmp_data_dir("start-window");
+    let state = DaemonState::bootstrap(DaemonConfig::defaults_in(&data)).unwrap();
+
+    let job_id = register_combed_job_without_binding(&state);
+    // deliberately NOT marked running: still `Starting`.
+
+    let s = state
+        .command
+        .status(job_id)
+        .expect("a starting job must still answer");
+    assert_eq!(s.frames_total, 0, "nothing has happened yet");
+
+    cleanup(&data);
+}

@@ -320,35 +320,46 @@ to call `health` and `command_start_combed` -> `bucket_wait` ->
 **Was:** all three package names returned `E404` from `npm view` on
 2026-05-23, and npmjs.com could not offer the trusted-publisher UI for
 a package page that did not yet exist.
-**Resolved.** Verified against the live registry on 2026-08-07:
-`terminal-commander` resolves with `dist-tags.latest = 0.1.86`, and the
-platform packages `@terminal-commander/{linux-x64,linux-arm64,
-windows-x64,mac-x64,mac-arm64}` all resolve (HTTP 200). The OIDC path
-is exercised, not merely configured: release PR #163 merged 2026-07-17
-and its `release-please` run published in 16m29s.
+**Resolved (first publish only).** Verified against the live registry on
+2026-08-07: `terminal-commander` resolves with `dist-tags.latest = 0.1.86`,
+and the platform packages `@terminal-commander/{linux-x64,linux-arm64,
+windows-x64,mac-x64,mac-arm64}` all resolve (HTTP 200). Release PR #163
+merged 2026-07-17 and its `release-please` run published in 16m29s.
 
-Publishing is therefore a normal two-gate flow, NOT automatic on a
-feature merge: merging a Conventional-Commits `feat:`/`fix:` PR to
-`main` makes release-please open/update a release PR; merging THAT
-release PR bumps the version and fires the OIDC publish jobs.
+**Correction (2026-08-07, same day).** An earlier revision of this entry
+claimed "the OIDC path is exercised, not merely configured". That was
+WRONG and is retracted. `release-please.yml` publishes with
+`NODE_AUTH_TOKEN: secrets.NPM_TOKEN_TC` at every publish job
+(`:534`, `:663`, `:748`, `:833`, `:918`, `:1009`), and its own header says
+"trusted-publisher OIDC not yet configured on npmjs.com for all package
+names". #163 therefore published by TOKEN. Trusted publishing remains
+unconfigured and Task 23 still owns the cutover.
+
+Publishing is a normal two-gate flow, NOT automatic on a feature merge:
+merging a Conventional-Commits `feat:`/`fix:` PR to `main` makes
+release-please open/update a release PR; merging THAT release PR bumps the
+version and fires the publish jobs.
 
 ### P1.5b — Disable the NPM10 bootstrap workflow + rotate NPM_TOKEN_TC
 
 **Source:** NPM10 goal file +
 `docs/release/npm-bootstrap-first-publish.md` §5.3.
 **Evidence:** `.github/workflows/npm-bootstrap-publish.yml` is the
-ONE-TIME `NPM_TOKEN_TC` path; standing capability is OIDC trusted
-publishing via `release-please.yml`. The bootstrap workflow must
-not remain dispatchable after the first publish succeeds, otherwise
-an accidental dispatch could publish a token-authorized version
-that bypasses the OIDC + provenance contract.
-**Status (2026-08-07): ACTIONABLE, and now overdue.** The first-publish
-precondition was met on 2026-07-17 (see P1.5), but
-`.github/workflows/npm-bootstrap-publish.yml` is still present and
-still `workflow_dispatch`-able at HEAD. Whether trusted publishing is
-configured on npmjs.com and whether `NPM_TOKEN_TC` still exists are
-operator-side facts that cannot be verified from the repository.
-**Proposed work:**
+ONE-TIME `NPM_TOKEN_TC` path; the intended standing capability is OIDC
+trusted publishing via `release-please.yml`.
+**Status (2026-08-07): BLOCKED, not actionable — precondition unmet.**
+An earlier revision of this entry called it "ACTIONABLE, and now overdue"
+on the strength of the first publish having landed. That was wrong, and is
+retracted: step 2 (rotate `NPM_TOKEN_TC`) would BREAK releases outright,
+because `release-please.yml` — the standing publish path — still
+authenticates with that same token on every job. Rotation is safe only
+AFTER the Task 23 OIDC cutover, which is the real precondition.
+
+What is still true, at lower severity than previously recorded: the
+bootstrap workflow remains `workflow_dispatch`-able and is a redundant
+second manual publish route. It does NOT expose a new credential class,
+since the standing workflow uses the same token.
+**Proposed work (post-Task-23 OIDC cutover, in this order):**
 1. Delete `.github/workflows/npm-bootstrap-publish.yml` OR rename
    it to `.disabled` so GitHub Actions stops indexing it.
 2. Rotate / invalidate `NPM_TOKEN_TC` on npmjs.com.
