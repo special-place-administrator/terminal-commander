@@ -788,6 +788,35 @@ mod runtime {
             // immediately consistent; the lifecycle waiter spawned in `start`
             // sees the terminal state and skips, avoiding a double event.
             let _ = self.jobs.cancel(job_id);
+
+            // spec 004 review (grok BLOCKER / kimi-k3 HIGH-1): the waiter's
+            // terminal-skip above means THIS is the only place a stopped PTY
+            // job can ever be persisted. Without the receipt, the binding is
+            // gone, no lane answers, and `command_status` reports `JobLost` --
+            // telling the agent the daemon died mid-run when the operator
+            // simply stopped the session. FR-005: an outcome that used to be
+            // readable must not become unreadable.
+            //
+            // `end_cause` stays None: an operator stop is an ordinary cancel,
+            // NOT an abandonment, and must not be written through the
+            // abandonment lane (which never overwrites a real receipt).
+            let duration_ms = self
+                .jobs
+                .get(job_id)
+                .and_then(|r| r.exit_info.as_ref().map(|e| e.duration_ms));
+            let evidence = pty_evidence_json(&metrics, duration_ms, b.probe_id);
+            crate::command::persist_job_receipt(
+                &self.store,
+                job_id,
+                b.bucket_id,
+                terminal_commander_core::JobState::Cancelled,
+                // A cancelled PTY job has no exit status. Never invent one.
+                None,
+                metrics.events_emitted,
+                Some(&evidence),
+                None,
+            );
+
             self.audit(
                 "pty_command_stop",
                 &job_id.to_wire_string(),

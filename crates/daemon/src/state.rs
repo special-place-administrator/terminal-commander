@@ -228,7 +228,7 @@ impl DaemonState {
                 None,
                 events,
                 evidence.as_deref(),
-                Some("abandoned"),
+                Some(terminal_commander_store::ABANDONED_END_CAUSE),
             );
             recorded = recorded.saturating_add(1);
         }
@@ -408,6 +408,7 @@ impl DaemonState {
             policy.clone(),
             Arc::clone(&activation),
             Arc::clone(&sources),
+            store.clone(),
         ));
         // PTY runtime on every host with a PTY backend (unix + Windows ConPTY).
         #[cfg(any(unix, windows))]

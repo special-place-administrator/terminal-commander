@@ -1994,7 +1994,8 @@ impl CommandRuntime {
         // state stays the truthful `Cancelled` and the exit code stays absent --
         // an abandoned job did not fail, and reporting it as a failure would be
         // the exact false negative this feature exists to remove.
-        let abandoned = row.end_cause.as_deref() == Some("abandoned");
+        let abandoned =
+            row.end_cause.as_deref() == Some(terminal_commander_store::ABANDONED_END_CAUSE);
         let (state_enum, exit_code, outcome_trust) = if abandoned {
             (JobState::Cancelled, None, OutcomeTrust::Abandoned)
         } else {
