@@ -1927,6 +1927,108 @@ impl CommandRuntime {
         })
     }
 
+    /// TC-B3 / spec 004 FR-015: reconstruct a terminal
+    /// [`CommandStatusResponse`] from a persisted job receipt, or `None` if no
+    /// receipt exists (the caller then decides between `JobLost` and
+    /// `UnknownJob`).
+    ///
+    /// Lives on the ENGINE, not the IPC handler, so both delivery shapes reach
+    /// it. `docs/EMBEDDING.md` documents `state.command.status` as the
+    /// embedder's status read, and the constitution's Additional Constraints
+    /// require both delivery shapes to terminate at the same authority. While
+    /// this lived in the handler an embedding host accumulated receipt rows it
+    /// had no supported typed API to read back.
+    ///
+    /// NOTE: this read performs a WRITE -- it stamps the receipt's restart
+    /// marker so the durable row records that it was read post-restart. That is
+    /// deliberate and best-effort; a failed stamp does not change the response.
+    ///
+    /// Counters come from the evidence captured at the terminal transition, so
+    /// a reconstructed pass is USABLE rather than merely labelled. Receipts
+    /// written before the evidence migration carry none, and that absence is
+    /// reported as-is rather than being disguised as zero observations.
+    #[must_use]
+    pub fn reconstructed_status(&self, job_id: JobId) -> Option<CommandStatusResponse> {
+        use terminal_commander_core::{BucketId, ProbeId};
+
+        let wire = job_id.to_wire_string();
+        let row = self.store.get_job_receipt(&wire).ok().flatten()?;
+
+        let state_enum = match row.terminal_state.as_str() {
+            "exited" => JobState::Exited,
+            "cancelled" => JobState::Cancelled,
+            // Any other persisted label (incl. "failed" and the conservative
+            // fallback) maps to Failed: a terminal, non-success state.
+            _ => JobState::Failed,
+        };
+        // Recover the bucket id from the receipt; a parse failure (corrupt row)
+        // falls back to a fresh id rather than failing the whole status read.
+        let bucket_id = BucketId::parse_wire(&row.bucket_id).unwrap_or_default();
+        let events_emitted = serde_json::from_str::<serde_json::Value>(&row.final_signal_counts)
+            .ok()
+            .and_then(|v| v.get("events_emitted").and_then(serde_json::Value::as_u64))
+            .unwrap_or(0);
+
+        // spec 004 FR-002: the evidence a live observer would have had. `None`
+        // for pre-migration rows.
+        let evidence = row
+            .metrics_json
+            .as_deref()
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok());
+        let num = |key: &str| -> u64 {
+            evidence
+                .as_ref()
+                .and_then(|v| v.get(key).and_then(serde_json::Value::as_u64))
+                .unwrap_or(0)
+        };
+        let duration_ms = evidence
+            .as_ref()
+            .and_then(|v| v.get("duration_ms").and_then(serde_json::Value::as_u64));
+        let probe_id = evidence
+            .as_ref()
+            .and_then(|v| v.get("probe_id").and_then(serde_json::Value::as_str))
+            .and_then(|s| ProbeId::parse_wire(s).ok())
+            .unwrap_or_default();
+
+        // spec 004 D1: abandonment rides the trust indicator. The terminal
+        // state stays the truthful `Cancelled` and the exit code stays absent --
+        // an abandoned job did not fail, and reporting it as a failure would be
+        // the exact false negative this feature exists to remove.
+        let abandoned = row.end_cause.as_deref() == Some("abandoned");
+        let (state_enum, exit_code, outcome_trust) = if abandoned {
+            (JobState::Cancelled, None, OutcomeTrust::Abandoned)
+        } else {
+            (state_enum, row.exit_code, OutcomeTrust::Reconstructed)
+        };
+
+        let _ = self.store.mark_job_receipt_restarted(&wire);
+
+        Some(CommandStatusResponse {
+            job_id,
+            bucket_id,
+            probe_id,
+            state: state_enum,
+            frames_total: num("frames_total"),
+            frames_stdout: num("frames_stdout"),
+            frames_stderr: num("frames_stderr"),
+            bytes_total: num("bytes_total"),
+            events_emitted,
+            frames_suppressed: num("frames_suppressed"),
+            frames_suppressed_progress: num("frames_suppressed_progress"),
+            frames_suppressed_dedupe: num("frames_suppressed_dedupe"),
+            exit_code,
+            signal: None,
+            duration_ms,
+            // The no-silence frame tail is memory-only by design (spec D2:
+            // constitution III bars raw frames from persistent output). Its
+            // absence here does NOT mean the command produced no output.
+            receipt: None,
+            // Derived, never set independently.
+            restarted: outcome_trust != OutcomeTrust::Observed,
+            outcome_trust,
+        })
+    }
+
     /// Test helper.
     #[must_use]
     pub fn job_record(&self, job_id: JobId) -> Option<JobRecord> {
