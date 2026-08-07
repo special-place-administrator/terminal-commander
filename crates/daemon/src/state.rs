@@ -191,10 +191,14 @@ impl DaemonState {
         // spike. The migration is idempotent.
         store.ensure_registry().map_err(BootstrapError::Store)?;
 
-        // TC-B3: apply the V0007 job-receipt migration eagerly so the
-        // post-restart `command_status` fallback read never races a lazy
-        // migration on the read-only path. Idempotent.
-        store.ensure_job_receipts().map_err(BootstrapError::Store)?;
+        // TC-B3 / spec 004: apply the receipt migrations eagerly (V0007 +
+        // V0003 + V0008) so the post-restart `command_status` fallback read
+        // never races a lazy migration on the read-only path, and so the
+        // evidence columns always exist before the first terminal transition.
+        // Idempotent.
+        store
+            .ensure_outcome_evidence()
+            .map_err(BootstrapError::Store)?;
 
         let buckets = Arc::new(BucketManager::new());
         let rings = Arc::new(ContextRingManager::new());

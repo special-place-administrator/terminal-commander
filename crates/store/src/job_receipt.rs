@@ -26,6 +26,10 @@ use crate::{EventStore, EventStoreError, Result};
 /// and workspace snapshots.
 const MIGRATION_V0007: &str = include_str!("../migrations/V0007__job_receipt.sql");
 
+/// Embedded V0008 migration: outcome evidence (`metrics_json`, `end_cause`)
+/// plus the `(action, subject)` audit index that lost-detection needs.
+const MIGRATION_V0008: &str = include_str!("../migrations/V0008__outcome_evidence.sql");
+
 /// A persisted job/bucket receipt row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobReceiptRow {
@@ -43,6 +47,19 @@ pub struct JobReceiptRow {
     /// the originating daemon process is still the one that wrote it.
     pub restarted_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
+    /// Bounded JSON object of NUMERIC AND IDENTIFIER evidence captured at the
+    /// terminal transition -- frames, bytes, suppression counts, duration,
+    /// probe id. `None` for rows written before V0008; such a row is reported
+    /// honestly rather than as zeroes-presented-as-observations.
+    ///
+    /// Carries NO frame text. Constitution III bars raw frames from persistent
+    /// output, which is why the no-silence tail is not persisted (decision D2).
+    pub metrics_json: Option<String>,
+    /// Why the job ended, when that is not self-evident from `terminal_state`.
+    /// Today the only value is `abandoned` (ended by daemon shutdown or stale
+    /// replacement). Abandonment is deliberately NOT a `JobState` variant
+    /// (decision D1): the lifecycle state stays the truthful `cancelled`.
+    pub end_cause: Option<String>,
 }
 
 impl EventStore {
@@ -70,11 +87,47 @@ impl EventStore {
         Ok(())
     }
 
+    /// Run the V0008 outcome-evidence migration. Idempotent.
+    ///
+    /// Depends on BOTH prior tables existing: it alters `job_receipts` (V0007)
+    /// and indexes `audit_records` (V0003). Both `ensure_*` calls below are
+    /// themselves idempotent, so this is safe to call on every boot and in any
+    /// order relative to other `ensure_*` functions.
+    pub fn ensure_outcome_evidence(&mut self) -> Result<()> {
+        self.ensure_job_receipts()?;
+        self.ensure_audit()?;
+        let v8: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 8",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if v8 == 0 {
+            let tx = self.conn.transaction()?;
+            tx.execute_batch(MIGRATION_V0008)
+                .map_err(|e| EventStoreError::Migration(e.to_string()))?;
+            let now_s = OffsetDateTime::now_utc().format(&Rfc3339)?;
+            tx.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (8, ?1)",
+                params![now_s],
+            )?;
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
     /// Persist (or replace) a job receipt on a terminal transition. The
     /// caller supplies the opaque ids, the terminal state string, the exit
-    /// code, and the pre-bounded `final_signal_counts` JSON. `INSERT OR
-    /// REPLACE` keeps the write idempotent if a transition is recorded
-    /// twice (the terminal state never changes after the first write).
+    /// code, the pre-bounded `final_signal_counts` JSON, the pre-bounded
+    /// `metrics_json` evidence object, and an optional `end_cause`.
+    /// `INSERT OR REPLACE` keeps the write idempotent if a transition is
+    /// recorded twice (the terminal state never changes after the first write).
+    ///
+    /// `metrics_json` MUST contain only numeric and identifier evidence. Frame
+    /// text is forbidden here by constitution III (no raw frames in persistent
+    /// output); the caller is responsible for honouring that.
     pub fn record_job_receipt(
         &mut self,
         job_id: &str,
@@ -82,21 +135,26 @@ impl EventStore {
         terminal_state: &str,
         exit_code: Option<i32>,
         final_signal_counts: &str,
+        metrics_json: Option<&str>,
+        end_cause: Option<&str>,
     ) -> Result<()> {
-        self.ensure_job_receipts()?;
+        self.ensure_outcome_evidence()?;
         let now_s = OffsetDateTime::now_utc().format(&Rfc3339)?;
         self.conn.execute(
             "INSERT OR REPLACE INTO job_receipts
                 (job_id, bucket_id, terminal_state, exit_code,
-                 final_signal_counts, restarted_at, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
+                 final_signal_counts, restarted_at, created_at,
+                 metrics_json, end_cause)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8)",
             params![
                 job_id,
                 bucket_id,
                 terminal_state,
                 exit_code,
                 final_signal_counts,
-                now_s
+                now_s,
+                metrics_json,
+                end_cause
             ],
         )?;
         Ok(())
@@ -107,11 +165,16 @@ impl EventStore {
     /// This is the post-restart fallback read: the in-memory job is gone,
     /// so the status handler reads the durable receipt and returns a
     /// restart-marked terminal result rather than a bare error.
+    ///
+    /// `metrics_json` is `None` for rows written before V0008. Callers MUST
+    /// report that absence honestly and MUST NOT substitute zeroes, which is
+    /// the exact defect this feature exists to remove.
     pub fn get_job_receipt(&self, job_id: &str) -> Result<Option<JobReceiptRow>> {
         self.conn
             .query_row(
                 "SELECT job_id, bucket_id, terminal_state, exit_code,
-                        final_signal_counts, restarted_at, created_at
+                        final_signal_counts, restarted_at, created_at,
+                        metrics_json, end_cause
                  FROM job_receipts WHERE job_id = ?1",
                 params![job_id],
                 |row| {
@@ -122,6 +185,8 @@ impl EventStore {
                     let final_signal_counts: String = row.get(4)?;
                     let restarted_at: Option<String> = row.get(5)?;
                     let created_at: String = row.get(6)?;
+                    let metrics_json: Option<String> = row.get(7)?;
+                    let end_cause: Option<String> = row.get(8)?;
                     Ok((
                         job_id,
                         bucket_id,
@@ -130,6 +195,8 @@ impl EventStore {
                         final_signal_counts,
                         restarted_at,
                         created_at,
+                        metrics_json,
+                        end_cause,
                     ))
                 },
             )
@@ -143,6 +210,8 @@ impl EventStore {
                     final_signal_counts,
                     restarted_at,
                     created_at,
+                    metrics_json,
+                    end_cause,
                 )| {
                     let created_at = OffsetDateTime::parse(&created_at, &Rfc3339)
                         .map_err(|e| EventStoreError::Migration(e.to_string()))?;
@@ -158,6 +227,8 @@ impl EventStore {
                         final_signal_counts,
                         restarted_at,
                         created_at,
+                        metrics_json,
+                        end_cause,
                     })
                 },
             )
@@ -189,9 +260,12 @@ mod tests {
 
     fn store() -> EventStore {
         let mut s = EventStore::in_memory().expect("open in-memory store");
-        s.ensure_job_receipts().expect("migrate job_receipts");
+        s.ensure_outcome_evidence()
+            .expect("migrate job_receipts + outcome evidence");
         s
     }
+
+    const EVIDENCE: &str = r#"{"frames_total":4586,"bytes_total":334421,"duration_ms":641248}"#;
 
     #[test]
     fn record_then_get_round_trips() {
@@ -202,6 +276,8 @@ mod tests {
             "exited",
             Some(0),
             r#"{"events_emitted":2}"#,
+            Some(EVIDENCE),
+            None,
         )
         .expect("record");
         let r = s.get_job_receipt("job_abc").expect("get").expect("present");
@@ -211,6 +287,8 @@ mod tests {
         assert_eq!(r.exit_code, Some(0));
         assert_eq!(r.final_signal_counts, r#"{"events_emitted":2}"#);
         assert!(r.restarted_at.is_none());
+        assert_eq!(r.metrics_json.as_deref(), Some(EVIDENCE));
+        assert_eq!(r.end_cause, None);
     }
 
     #[test]
@@ -222,9 +300,9 @@ mod tests {
     #[test]
     fn record_is_idempotent_on_replace() {
         let mut s = store();
-        s.record_job_receipt("job_x", "bkt_1", "exited", Some(1), "{}")
+        s.record_job_receipt("job_x", "bkt_1", "exited", Some(1), "{}", None, None)
             .expect("first");
-        s.record_job_receipt("job_x", "bkt_1", "exited", Some(1), "{}")
+        s.record_job_receipt("job_x", "bkt_1", "exited", Some(1), "{}", None, None)
             .expect("replace");
         let r = s.get_job_receipt("job_x").expect("get").expect("present");
         assert_eq!(r.exit_code, Some(1));
@@ -234,12 +312,14 @@ mod tests {
     fn ensure_is_idempotent() {
         let mut s = store();
         s.ensure_job_receipts().expect("second ensure is a no-op");
+        s.ensure_outcome_evidence()
+            .expect("second outcome-evidence ensure is a no-op");
     }
 
     #[test]
     fn mark_restarted_stamps_once() {
         let mut s = store();
-        s.record_job_receipt("job_r", "bkt_1", "exited", Some(0), "{}")
+        s.record_job_receipt("job_r", "bkt_1", "exited", Some(0), "{}", None, None)
             .expect("record");
         s.mark_job_receipt_restarted("job_r").expect("mark");
         let r = s.get_job_receipt("job_r").expect("get").expect("present");
@@ -249,10 +329,51 @@ mod tests {
     #[test]
     fn cancelled_state_round_trips_with_null_exit_code() {
         let mut s = store();
-        s.record_job_receipt("job_c", "bkt_2", "cancelled", None, "{}")
+        s.record_job_receipt("job_c", "bkt_2", "cancelled", None, "{}", None, None)
             .expect("record");
         let r = s.get_job_receipt("job_c").expect("get").expect("present");
         assert_eq!(r.terminal_state, "cancelled");
         assert_eq!(r.exit_code, None);
+    }
+
+    #[test]
+    fn absent_evidence_stays_absent_and_is_never_zeroed() {
+        // A row written without evidence (the pre-V0008 shape) MUST read back
+        // as absent. Substituting zeroes here would recreate the exact defect
+        // this feature removes: a genuine pass indistinguishable from a run
+        // that produced nothing.
+        let mut s = store();
+        s.record_job_receipt("job_legacy", "bkt_1", "exited", Some(0), "{}", None, None)
+            .expect("record");
+        let r = s
+            .get_job_receipt("job_legacy")
+            .expect("get")
+            .expect("present");
+        assert_eq!(
+            r.metrics_json, None,
+            "absent evidence must not be defaulted to a zeroed object"
+        );
+    }
+
+    #[test]
+    fn abandoned_end_cause_round_trips_without_an_exit_code() {
+        // Decision D1: abandonment rides `end_cause`, NOT a new terminal state.
+        // The terminal state stays the truthful `cancelled`, so an older reader
+        // sees a cancelled job rather than a fabricated failure.
+        let mut s = store();
+        s.record_job_receipt(
+            "job_ab",
+            "bkt_3",
+            "cancelled",
+            None,
+            "{}",
+            None,
+            Some("abandoned"),
+        )
+        .expect("record");
+        let r = s.get_job_receipt("job_ab").expect("get").expect("present");
+        assert_eq!(r.terminal_state, "cancelled");
+        assert_eq!(r.exit_code, None);
+        assert_eq!(r.end_cause.as_deref(), Some("abandoned"));
     }
 }

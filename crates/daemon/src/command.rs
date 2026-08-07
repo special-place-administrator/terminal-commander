@@ -1454,6 +1454,14 @@ impl CommandRuntime {
                 // the receipt here too (this path bypasses the finish/cancel
                 // block below). The exit code is whatever the outcome carried
                 // (a graceful stop may still have an exit code).
+                //
+                // spec 004 R1: this path performs NO `bucket_append`, so the
+                // reap-time count IS the final count. Adding one here would
+                // invent an event that never happened.
+                let stop_duration_ms = waiter_jobs
+                    .get(job_id)
+                    .and_then(|r| r.exit_info.as_ref().map(|e| e.duration_ms));
+                let stop_evidence = evidence_json(&final_metrics, stop_duration_ms, probe_id);
                 persist_job_receipt(
                     &waiter_store,
                     job_id,
@@ -1461,6 +1469,8 @@ impl CommandRuntime {
                     state,
                     receipt_exit_code,
                     rule_driven_events,
+                    Some(&stop_evidence),
+                    None,
                 );
                 waiter_dedup.lock().remove(&dedup_k);
                 return;
@@ -1472,28 +1482,15 @@ impl CommandRuntime {
                 ProbeOutcome::Cancelled => waiter_jobs.cancel(job_id),
             };
 
-            // TC-B3: persist the compact job receipt on this terminal
-            // transition. The authoritative terminal state is read back from
-            // the job manager (set by finish/cancel just above); fall back to
-            // the outcome if the record vanished. A write failure is
-            // logged-and-dropped -- the receipt is a post-restart durability
-            // backstop, never a correctness dependency of the live exit path.
-            // `outcome` was moved into the draft match above; the job manager
-            // is the authoritative source for the terminal state finish/cancel
-            // just set. The fallback (record vanished) cannot normally happen
-            // because finish/cancel keep the record; `Failed` is the safe
-            // conservative default that never overstates success.
+            // TC-B3: the authoritative terminal state is read back from the job
+            // manager (set by finish/cancel just above); fall back to the
+            // outcome if the record vanished. `outcome` was moved into the
+            // draft match above. The fallback (record vanished) cannot normally
+            // happen because finish/cancel keep the record; `Failed` is the
+            // safe conservative default that never overstates success.
             let terminal_state = waiter_jobs
                 .get(job_id)
                 .map_or(terminal_commander_core::JobState::Failed, |r| r.state);
-            persist_job_receipt(
-                &waiter_store,
-                job_id,
-                waiter_bucket,
-                terminal_state,
-                receipt_exit_code,
-                rule_driven_events,
-            );
 
             // TC-2 eviction-on-completion (PRIMARY release). The job is now
             // terminal on BOTH outcomes (normal exit and cancel reach here),
@@ -1511,6 +1508,37 @@ impl CommandRuntime {
                 final_metrics.events_emitted = final_metrics.events_emitted.saturating_add(1);
                 waiter_jobs.record_event(job_id);
             }
+
+            // spec 004 R1: persist the receipt HERE -- after the lifecycle
+            // append -- and pass the POST-append `final_metrics.events_emitted`.
+            //
+            // Both halves are required and each alone is wrong. Persisting at
+            // the old site (before the append) recorded one event fewer than a
+            // live observer saw, so every reconstructed status carried a
+            // permanent off-by-one. Merely relocating the call would change
+            // nothing, because the count travels as a by-value argument.
+            // Computing `+1` at the old site would be wrong too: the bump is
+            // conditional on `bucket_append` succeeding, so a failed append
+            // would have us claim an event that does not exist.
+            //
+            // `rule_driven_events` is deliberately NOT reused as the persisted
+            // count -- it is the PRE-bump value and still gates the TCE-ERG-1
+            // no-silence receipt above. Redefining it would silently disable
+            // that carve-out for every command.
+            let exit_duration_ms = waiter_jobs
+                .get(job_id)
+                .and_then(|r| r.exit_info.as_ref().map(|e| e.duration_ms));
+            let exit_evidence = evidence_json(&final_metrics, exit_duration_ms, probe_id);
+            persist_job_receipt(
+                &waiter_store,
+                job_id,
+                waiter_bucket,
+                terminal_state,
+                receipt_exit_code,
+                final_metrics.events_emitted,
+                Some(&exit_evidence),
+                None,
+            );
 
             // Update the stored metrics for command_status callers.
             // The binding's `sifter`, `inline_rules`, and the receipt
@@ -1922,21 +1950,63 @@ async fn drive_to_exit(mut probe: ProcessProbe) -> (ProcessProbeMetrics, ProbeOu
     (probe.metrics(), outcome)
 }
 
-/// TC-B3 (FR-027): persist a compact job receipt on a terminal transition.
+/// Build the bounded evidence object persisted alongside a job receipt
+/// (spec 004 FR-002).
+///
+/// NUMERIC AND IDENTIFIER DATA ONLY. Constitution III bars raw frames from
+/// persistent output, which is why the no-silence tail is deliberately absent
+/// here (spec decision D2). Every value below is either a counter or an opaque
+/// id, so no escaping is required and the string cannot carry stream content.
+fn evidence_json(
+    metrics: &ProcessProbeMetrics,
+    duration_ms: Option<u64>,
+    probe_id: ProbeId,
+) -> String {
+    let duration = duration_ms.map_or_else(|| "null".to_owned(), |d| d.to_string());
+    format!(
+        "{{\"frames_total\":{},\"frames_stdout\":{},\"frames_stderr\":{},\
+         \"bytes_total\":{},\"frames_suppressed\":{},\
+         \"frames_suppressed_progress\":{},\"frames_suppressed_dedupe\":{},\
+         \"duration_ms\":{},\"probe_id\":\"{}\"}}",
+        metrics.frames_total,
+        metrics.frames_stdout,
+        metrics.frames_stderr,
+        metrics.bytes_total,
+        metrics.frames_suppressed,
+        metrics.frames_suppressed_progress,
+        metrics.frames_suppressed_dedupe,
+        duration,
+        probe_id.to_wire_string(),
+    )
+}
+
+/// TC-B3 (FR-027) / spec 004: persist a job receipt on a terminal transition.
 ///
 /// Maps the terminal [`JobState`] to a stable lowercase string, encodes the
-/// rule-driven event count as a small JSON object, and writes through the
+/// event count and the bounded evidence object, and writes through the
 /// single-writer store actor. A write failure is logged-and-dropped: the
 /// receipt is a post-restart durability backstop, never a correctness
 /// dependency of the live exit path, so a store hiccup must not abort the
 /// waiter or corrupt the in-memory terminal state.
+///
+/// `events_emitted` MUST be the count a live observer of the same run would
+/// see. On the natural-exit path that means the value AFTER the lifecycle
+/// append; on the `stop()` path no append occurs, so the reap-time count is
+/// already correct. Passing the pre-append value on the natural-exit path
+/// would bake a permanent off-by-one into every reconstructed status.
+///
+/// `end_cause` is `Some("abandoned")` only when the job was ended by daemon
+/// shutdown or stale replacement rather than reaching its own conclusion. The
+/// terminal state stays the truthful `cancelled` (spec decision D1).
 fn persist_job_receipt(
     store: &StoreClient,
     job_id: JobId,
     bucket_id: BucketId,
     state: JobState,
     exit_code: Option<i32>,
-    rule_driven_events: u64,
+    events_emitted: u64,
+    metrics_json: Option<&str>,
+    end_cause: Option<&str>,
 ) {
     let terminal_state = match state {
         JobState::Exited => "exited",
@@ -1947,13 +2017,15 @@ fn persist_job_receipt(
         JobState::Starting => "starting",
         JobState::Running => "running",
     };
-    let counts = format!("{{\"events_emitted\":{rule_driven_events}}}");
+    let counts = format!("{{\"events_emitted\":{events_emitted}}}");
     if let Err(e) = store.record_job_receipt(
         &job_id.to_wire_string(),
         &bucket_id.to_wire_string(),
         terminal_state,
         exit_code,
         &counts,
+        metrics_json,
+        end_cause,
     ) {
         // Honest degradation: the live job is already terminal and tracked in
         // memory; only the durable backstop failed. Surface it in the log,
