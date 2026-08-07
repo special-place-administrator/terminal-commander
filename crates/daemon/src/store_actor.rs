@@ -121,6 +121,8 @@ pub enum StoreOp {
     /// `EventStore::mark_job_receipt_restarted(job_id)` -> stamp the
     /// restart marker on a post-restart read.
     MarkJobReceiptRestarted { job_id: String },
+    /// `EventStore::job_start_recorded(job_id)` -> bool (spec 004 FR-009).
+    JobStartRecorded { job_id: String },
     /// Drain queue, run `wal_checkpoint(FULL)`, exit thread.
     Shutdown,
 }
@@ -496,6 +498,18 @@ impl StoreClient {
             other => Err(unexpected_store_reply("MarkJobReceiptRestarted", &other)),
         }
     }
+
+    /// Did the daemon durably record this job STARTING? Distinguishes a lost
+    /// job from an unrecognised id (spec 004 FR-009). Best-effort: `false`
+    /// means "no evidence", never proof the job never existed.
+    pub fn job_start_recorded(&self, job_id: &str) -> Result<bool, EventStoreError> {
+        match self.call(StoreOp::JobStartRecorded {
+            job_id: job_id.to_owned(),
+        })? {
+            StoreReply::Bool(found) => Ok(found),
+            other => Err(unexpected_store_reply("JobStartRecorded", &other)),
+        }
+    }
 }
 
 fn unexpected_store_reply(op: &str, reply: &StoreReply) -> EventStoreError {
@@ -542,6 +556,10 @@ fn drain_remaining(store: &mut EventStore, rx: &Receiver<StoreMsg>) {
     }
 }
 
+// One flat arm per `StoreOp` variant. Length tracks the op count, not
+// complexity; splitting it would scatter the 1:1 op-to-method mapping that
+// makes the actor auditable.
+#[allow(clippy::too_many_lines)]
 fn execute(store: &mut EventStore, op: StoreOp) -> Result<StoreReply, EventStoreError> {
     match op {
         StoreOp::EnsureAudit => store.ensure_audit().map(|()| StoreReply::Unit),
@@ -639,6 +657,9 @@ fn execute(store: &mut EventStore, op: StoreOp) -> Result<StoreReply, EventStore
         StoreOp::MarkJobReceiptRestarted { job_id } => store
             .mark_job_receipt_restarted(&job_id)
             .map(|()| StoreReply::Unit),
+        StoreOp::JobStartRecorded { job_id } => {
+            store.job_start_recorded(&job_id).map(StoreReply::Bool)
+        }
         StoreOp::Shutdown => Ok(StoreReply::Unit),
     }
 }

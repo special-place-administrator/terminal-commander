@@ -181,14 +181,28 @@ pub(in crate::ipc::server) fn handle_command_status(
             // 2. No live owner. Consult the persisted receipt: a known terminal
             //    outcome from disk beats a bare "unknown job" (constitution VII
             //    honest degradation).
-            state.command.reconstructed_status(job_id).map_or_else(
-                || {
-                    Err(map_command_error(crate::command::CommandError::UnknownJob(
-                        job_id,
-                    )))
-                },
-                |resp| Ok(IpcResponse::CommandStatus(resp)),
-            )
+            if let Some(resp) = state.command.reconstructed_status(job_id) {
+                return Ok(IpcResponse::CommandStatus(resp));
+            }
+            // 3. No receipt exists. Did the daemon durably record this job
+            //    STARTING? If so it is LOST: it began and never reached a
+            //    recorded terminal transition, which is a diagnosis rather than
+            //    the "never heard of it" that `UnknownJob` implies.
+            //
+            //    Fails safe (spec FR-011). Audit emits are dropped on failure at
+            //    the call site, so absence is not proof; an errored or empty
+            //    lookup degrades to `UnknownJob` and NEVER to a terminal
+            //    outcome. The failure direction is one-way by construction.
+            let wire = job_id.to_wire_string();
+            if state.store.job_start_recorded(&wire).unwrap_or(false) {
+                return Err(IpcError::new(
+                    IpcErrorCode::JobLost,
+                    format!("job {wire} started but never recorded a terminal transition"),
+                ));
+            }
+            Err(map_command_error(crate::command::CommandError::UnknownJob(
+                job_id,
+            )))
         }
         Err(e) => Err(map_command_error(e)),
     }

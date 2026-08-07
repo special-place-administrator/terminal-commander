@@ -299,6 +299,53 @@ impl EventStore {
         Ok(u64::try_from(n).unwrap_or(0))
     }
 
+    /// spec 004 FR-009: did the daemon durably record this job STARTING?
+    ///
+    /// Lets a status read distinguish a job that started and never reached a
+    /// recorded terminal transition ("lost") from an identifier the daemon has
+    /// no record of at all ("unknown"). Reads only; writes nothing.
+    ///
+    /// The four actions below are every lane that records a start against a
+    /// job-id subject:
+    ///
+    /// | Lane | Action |
+    /// |---|---|
+    /// | combed | `command_start` |
+    /// | PTY (argv) | `pty_command_start` |
+    /// | PTY (session) | `shell_session_start` |
+    /// | file watch | `file_watch_start` |
+    ///
+    /// `decision = 'allow'` is required, not cosmetic: the combed lane also
+    /// writes a `command_start` row with decision `error` on a spawn failure,
+    /// and deny rows share these action names with argv/path subjects. Filtering
+    /// on the decision keeps a rejected or failed start from reading as a lost
+    /// job.
+    ///
+    /// NOTE: an earlier design keyed this on `job_start`, which
+    /// `Router::job_start` emits. That function has no production caller -- all
+    /// three runtimes call `JobManager::start` directly -- so the predicate
+    /// would have matched nothing, forever, while looking correct.
+    ///
+    /// Best-effort by nature: audit emits are dropped on failure at the call
+    /// site, so a missing row does not prove a job never started. The caller
+    /// MUST therefore treat `false` as "unknown", never as evidence of anything.
+    pub fn job_start_recorded(&self, job_id: &str) -> Result<bool> {
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM audit_records
+                 WHERE subject = ?1
+                   AND decision = 'allow'
+                   AND action IN ('command_start', 'pty_command_start',
+                                  'shell_session_start', 'file_watch_start')
+                 LIMIT 1",
+                params![job_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     /// Returns the `(name, type)` of each column on the `audit_records`
     /// table. Used by structural schema tests to prove no BLOB / raw
     /// columns are added without an explicit doctrine change.
