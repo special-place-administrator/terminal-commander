@@ -80,6 +80,8 @@ the reported output volume matches what the output tail returns for that job.
 - [ ] T016 [US2] Re-read the three internal `status()` callers against the widened behaviour: `crates/daemon/src/ipc/server.rs:1045`, `crates/daemon/src/ipc/handlers/runtime.rs:17-18`, `crates/daemon/src/subscriptions/pull.rs:428-429`. All were verified unable to pass a cross-lane id; confirm that still holds.
 - [ ] T017 [US2] Verify `command_output_tail` still answers cross-lane and still returns real frames. It is correct today and must not be swept up by the guard.
 
+- [ ] T057 [P] [US2] Add a test asserting a **still-running** interactive job never reports a terminal state or fabricated counts, covering the spec edge case that T010/T011 (finished jobs) leave open
+
 **Checkpoint**: no lane reports zero counters while output exists.
 
 ---
@@ -106,6 +108,8 @@ restart, poll again, and confirm the evidence matches.
 - [ ] T024 [US1] Populate the reconstruction from persisted evidence instead of hardcoded zeros, in `crates/daemon/src/ipc/handlers/command.rs`. Keep the real `exit_code` — never force null (spec FR-008).
 - [ ] T025 [US1] Persist a receipt from the PTY waiter in `crates/daemon/src/pty_command.rs`, mirroring the combed finalization. Metrics and identifiers only — no frame text, per Constitution III and decision D2.
 
+- [ ] T058 [P] [US1] Add a test for the append-failure path: when the lifecycle `bucket_append` fails, the persisted event count MUST NOT claim an event that does not exist. T022 avoids this bug by construction; this test pins it so a later refactor cannot reintroduce it.
+
 **Checkpoint**: a reconstructed pass is usable, not merely labelled.
 
 ---
@@ -131,6 +135,8 @@ told what each value means.
 - [ ] T030 [US3] Rewrite the `command_status` tool description at `crates/mcp/src/tools.rs:1525` per `contracts/mcp-facade.md`. It currently never mentions `restarted`, so this writes a contract where none exists. Include the sentence that a missing tail does not mean no output.
 - [ ] T031 [P] [US3] Add `outcome_trust` to the `run_and_watch` description at `crates/mcp/src/tools.rs:1293`, alongside the existing `degraded`/`recover_hint` vocabulary
 - [ ] T032 [P] [US3] Update `docs/mcp/OMNI_PLAYBOOK.md` so the interactive/REPL section states a finished PTY job's status is readable and its counters are real
+
+- [ ] T059 [P] [US3] Add a compatibility test asserting a consumer built against the pre-abandonment shape decodes an abandoned outcome as `cancelled` and never as success or failure. This is the specific property decision D1 was chosen to guarantee, and T027's general compat test does not cover it.
 
 **Checkpoint**: an agent branches on one field instead of inferring from zeros.
 
@@ -238,7 +244,8 @@ state stays `cancelled`. Writing an unrecognised terminal label would surface as
 1. T022 before T024 — reconstruction must read a correct count, not bake in the off-by-one.
 2. US2 before US3 — see above.
 3. T042/T043 before T039 — the stale-replacement test needs the verb.
-4. T053/T054 last — both gates are mandatory because this change touches `cfg(windows)` code **and** adds tests (`CONTRIBUTING.md` §6.1).
+4. T028 before T044 — `outcome_trust` must exist at every construction site before US5 maps `end_cause` onto it. This crosses a story boundary (US3 → US5) and is the one dependency the per-story structure hides.
+5. T053/T054 last — both gates are mandatory because this change touches `cfg(windows)` code **and** adds tests (`CONTRIBUTING.md` §6.1).
 
 ---
 
