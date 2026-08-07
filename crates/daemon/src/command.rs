@@ -1870,6 +1870,23 @@ impl CommandRuntime {
         let rec = self
             .job_record(job_id)
             .ok_or(CommandError::UnknownJob(job_id))?;
+        // spec 004 FR-004: the job ledger is SHARED across the combed, PTY and
+        // watch lanes, so this lookup finds jobs this runtime does not own. It
+        // used to answer for them anyway -- with zeroed counters, because their
+        // metrics live in another runtime's map, and with `restarted: false`
+        // positively asserting those zeros were observed live. Decline instead,
+        // so the caller routes to the lane that actually has the numbers.
+        //
+        // Guarding on `source_type` rather than live-map presence deliberately:
+        // there is a brief window during `start_combed_inner` where a combed job
+        // is in the ledger but not yet in `live`, and a presence guard would
+        // report a starting job as unknown.
+        if !matches!(
+            rec.config.source_type,
+            terminal_commander_core::SourceType::Process
+        ) {
+            return Err(CommandError::UnknownJob(job_id));
+        }
         let exited = rec.exit_info.is_some();
         let (metrics, receipt) = self
             .live

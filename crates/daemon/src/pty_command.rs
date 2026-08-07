@@ -781,6 +781,66 @@ mod runtime {
                 .collect()
         }
 
+        /// spec 004 FR-004: answer a `command_status` read for a job THIS lane
+        /// owns, with real counters.
+        ///
+        /// The job ledger is shared across lanes, so `CommandRuntime::status`
+        /// used to find PTY jobs and report zeroes for them while asserting
+        /// they were observed live. The counters were never missing -- they
+        /// live on the probe, exactly where `list()` reads them. Returns `None`
+        /// when this lane does not own the id, so the caller can try the next.
+        #[must_use]
+        pub fn status(
+            &self,
+            job_id: JobId,
+        ) -> Option<terminal_commander_ipc::protocol::CommandStatusResponse> {
+            use terminal_commander_ipc::protocol::OutcomeTrust;
+
+            let (bucket_id, probe_id, metrics) = {
+                let g = self.live.read();
+                let b = g.get(&job_id)?;
+                // Same read shape as `list()`: prefer the probe's live counters,
+                // fall back to the sink snapshot if the probe is momentarily
+                // busy. Never block a status read.
+                let metrics = if let Ok(guard) = b.probe.try_lock() {
+                    let probe_metrics = guard
+                        .as_ref()
+                        .map_or_else(PtyProbeMetrics::default, PtyProbe::metrics);
+                    let sink_snap = b.metrics_snapshot.lock().clone();
+                    combine_pty_metrics(&probe_metrics, &sink_snap)
+                } else {
+                    b.metrics_snapshot.lock().clone()
+                };
+                (b.bucket_id, b.probe_id, metrics)
+            };
+            let rec = self.jobs.get(job_id)?;
+            Some(terminal_commander_ipc::protocol::CommandStatusResponse {
+                job_id,
+                bucket_id,
+                probe_id,
+                state: rec.state,
+                frames_total: metrics.frames_total,
+                // A PTY is ONE merged stream by construction -- there is no
+                // separate stderr channel to report. Attributing the frames to
+                // stdout is truthful; splitting them would be invented detail.
+                frames_stdout: metrics.frames_total,
+                frames_stderr: 0,
+                bytes_total: metrics.bytes_total,
+                events_emitted: metrics.events_emitted,
+                frames_suppressed: metrics.frames_suppressed,
+                frames_suppressed_progress: metrics.frames_suppressed_progress,
+                frames_suppressed_dedupe: metrics.frames_suppressed_dedupe,
+                exit_code: rec.exit_info.as_ref().and_then(|e| e.exit_code),
+                signal: rec.exit_info.as_ref().and_then(|e| e.signal.clone()),
+                duration_ms: rec.exit_info.as_ref().map(|e| e.duration_ms),
+                // The no-silence receipt is a combed-lane construct; the PTY
+                // waiter never builds one.
+                receipt: None,
+                restarted: false,
+                outcome_trust: OutcomeTrust::Observed,
+            })
+        }
+
         pub fn rebind_jobs_in_scope(&self, scope: Option<ActivationScope>) -> PtyRebindReport {
             let work: Vec<PtyRebindWork> = {
                 let g = self.live.read();

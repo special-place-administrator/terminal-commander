@@ -564,6 +564,62 @@ impl WatchRuntime {
             .collect()
     }
 
+    /// spec 004 FR-004: answer a `command_status` read for a watch THIS lane
+    /// owns, with real counters.
+    ///
+    /// The job ledger is shared across lanes, so `CommandRuntime::status` used
+    /// to find watch jobs and report zeroes for them while asserting they were
+    /// observed live. Returns `None` when this lane does not own the id.
+    #[must_use]
+    pub fn status(
+        &self,
+        watch_id: JobId,
+    ) -> Option<terminal_commander_ipc::protocol::CommandStatusResponse> {
+        use terminal_commander_ipc::protocol::OutcomeTrust;
+
+        let (bucket_id, probe_id, metrics) = {
+            let g = self.live.read();
+            let b = g.get(&watch_id)?;
+            // Same non-blocking read shape as `list()`; a status read must
+            // never block on a busy probe.
+            let m = b.cancel.try_lock().map_or_else(
+                || b.metrics.lock().clone(),
+                |guard| {
+                    let probe_metrics = guard
+                        .as_ref()
+                        .map_or_else(FileProbeMetrics::default, FileProbe::metrics);
+                    let sink_snap = b.metrics.lock().clone();
+                    combine_file_metrics(&probe_metrics, &sink_snap)
+                },
+            );
+            (b.bucket_id, b.probe_id, m)
+        };
+        let rec = self.jobs.get(watch_id)?;
+        Some(terminal_commander_ipc::protocol::CommandStatusResponse {
+            job_id: watch_id,
+            bucket_id,
+            probe_id,
+            state: rec.state,
+            frames_total: metrics.frames_total,
+            // A file watch reads ONE stream; there is no stdout/stderr split to
+            // report. Attributing the frames to stdout is truthful.
+            frames_stdout: metrics.frames_total,
+            frames_stderr: 0,
+            bytes_total: metrics.bytes_total,
+            events_emitted: metrics.events_emitted,
+            frames_suppressed: metrics.frames_suppressed,
+            frames_suppressed_progress: metrics.frames_suppressed_progress,
+            frames_suppressed_dedupe: metrics.frames_suppressed_dedupe,
+            exit_code: rec.exit_info.as_ref().and_then(|e| e.exit_code),
+            signal: rec.exit_info.as_ref().and_then(|e| e.signal.clone()),
+            duration_ms: rec.exit_info.as_ref().map(|e| e.duration_ms),
+            // The no-silence receipt is a combed-lane construct.
+            receipt: None,
+            restarted: false,
+            outcome_trust: OutcomeTrust::Observed,
+        })
+    }
+
     /// Recompute per-watch sifters from the current scoped activation
     /// registry. Mirrors `CommandRuntime::rebind_jobs_in_scope` so a
     /// global or `Bucket`/`Job`/`Probe`-scoped activation change

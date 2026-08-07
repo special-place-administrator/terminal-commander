@@ -164,13 +164,23 @@ pub(in crate::ipc::server) fn handle_command_status(
 ) -> Result<IpcResponse, IpcError> {
     match state.command.status(params.job_id) {
         Ok(resp) => Ok(IpcResponse::CommandStatus(resp)),
-        // TC-B3 (FR-027): the in-memory job is gone. Before returning a bare
-        // error, consult the persisted receipt: if this job ran (and reached a
-        // terminal state) before a daemon restart, return a restart-marked
-        // terminal result instead of an error. Honest degradation
-        // (constitution VII): a known terminal outcome from disk beats a bare
-        // "unknown job".
+        // The combed runtime declined: either it does not own this lane's job
+        // (spec 004 FR-004) or the in-memory job is gone entirely.
         Err(crate::command::CommandError::UnknownJob(job_id)) => {
+            // 1. Ask the lane that owns it. A PTY or watch job answers here
+            //    with REAL counters. Constitution VII forbids discarding a live
+            //    job behind a bare error, and `command_status` is today the only
+            //    surface exposing a finished PTY job's exit code at all.
+            #[cfg(any(unix, windows))]
+            if let Some(resp) = state.pty.status(job_id) {
+                return Ok(IpcResponse::CommandStatus(resp));
+            }
+            if let Some(resp) = state.watch.status(job_id) {
+                return Ok(IpcResponse::CommandStatus(resp));
+            }
+            // 2. No live owner. Consult the persisted receipt: a known terminal
+            //    outcome from disk beats a bare "unknown job" (constitution VII
+            //    honest degradation).
             restart_marked_status_from_receipt(state, job_id).map_or_else(
                 || {
                     Err(map_command_error(crate::command::CommandError::UnknownJob(

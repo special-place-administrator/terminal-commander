@@ -38,7 +38,8 @@ pub use activation::ActivationRegistry;
 pub use audit::{AuditSink, InMemoryAudit, PersistentAudit};
 pub use command::{
     CommandError, CommandRuntime, CommandStartRequest, CommandStartResponse, CommandStatusResponse,
-    DEFAULT_COMMAND_SEVERITY_MIN, MAX_ARGV_ITEM_BYTES, MAX_ARGV_ITEMS, SHELL_INTERPRETERS_DENY,
+    DEFAULT_COMMAND_SEVERITY_MIN, MAX_ARGV_ITEM_BYTES, MAX_ARGV_ITEMS, OutcomeTrust,
+    SHELL_INTERPRETERS_DENY,
 };
 pub use config::{
     ConfigError, DaemonConfig, DaemonSection, LimitsSection, PolicyCapsSection, PolicyPathsSection,
