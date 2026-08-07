@@ -387,7 +387,7 @@ pub struct CommandStartRequest {
 // re-import, and the crate-root `pub use command::{...}` surface stays
 // stable.
 pub use terminal_commander_ipc::protocol::{
-    CommandReceipt, CommandStartResponse, CommandStatusResponse,
+    CommandReceipt, CommandStartResponse, CommandStatusResponse, OutcomeTrust,
 };
 
 /// EventSink that forwards drafts to the wired `Router`.
@@ -1454,6 +1454,14 @@ impl CommandRuntime {
                 // the receipt here too (this path bypasses the finish/cancel
                 // block below). The exit code is whatever the outcome carried
                 // (a graceful stop may still have an exit code).
+                //
+                // spec 004 R1: this path performs NO `bucket_append`, so the
+                // reap-time count IS the final count. Adding one here would
+                // invent an event that never happened.
+                let stop_duration_ms = waiter_jobs
+                    .get(job_id)
+                    .and_then(|r| r.exit_info.as_ref().map(|e| e.duration_ms));
+                let stop_evidence = evidence_json(&final_metrics, stop_duration_ms, probe_id);
                 persist_job_receipt(
                     &waiter_store,
                     job_id,
@@ -1461,6 +1469,8 @@ impl CommandRuntime {
                     state,
                     receipt_exit_code,
                     rule_driven_events,
+                    Some(&stop_evidence),
+                    None,
                 );
                 waiter_dedup.lock().remove(&dedup_k);
                 return;
@@ -1472,28 +1482,15 @@ impl CommandRuntime {
                 ProbeOutcome::Cancelled => waiter_jobs.cancel(job_id),
             };
 
-            // TC-B3: persist the compact job receipt on this terminal
-            // transition. The authoritative terminal state is read back from
-            // the job manager (set by finish/cancel just above); fall back to
-            // the outcome if the record vanished. A write failure is
-            // logged-and-dropped -- the receipt is a post-restart durability
-            // backstop, never a correctness dependency of the live exit path.
-            // `outcome` was moved into the draft match above; the job manager
-            // is the authoritative source for the terminal state finish/cancel
-            // just set. The fallback (record vanished) cannot normally happen
-            // because finish/cancel keep the record; `Failed` is the safe
-            // conservative default that never overstates success.
+            // TC-B3: the authoritative terminal state is read back from the job
+            // manager (set by finish/cancel just above); fall back to the
+            // outcome if the record vanished. `outcome` was moved into the
+            // draft match above. The fallback (record vanished) cannot normally
+            // happen because finish/cancel keep the record; `Failed` is the
+            // safe conservative default that never overstates success.
             let terminal_state = waiter_jobs
                 .get(job_id)
                 .map_or(terminal_commander_core::JobState::Failed, |r| r.state);
-            persist_job_receipt(
-                &waiter_store,
-                job_id,
-                waiter_bucket,
-                terminal_state,
-                receipt_exit_code,
-                rule_driven_events,
-            );
 
             // TC-2 eviction-on-completion (PRIMARY release). The job is now
             // terminal on BOTH outcomes (normal exit and cancel reach here),
@@ -1511,6 +1508,37 @@ impl CommandRuntime {
                 final_metrics.events_emitted = final_metrics.events_emitted.saturating_add(1);
                 waiter_jobs.record_event(job_id);
             }
+
+            // spec 004 R1: persist the receipt HERE -- after the lifecycle
+            // append -- and pass the POST-append `final_metrics.events_emitted`.
+            //
+            // Both halves are required and each alone is wrong. Persisting at
+            // the old site (before the append) recorded one event fewer than a
+            // live observer saw, so every reconstructed status carried a
+            // permanent off-by-one. Merely relocating the call would change
+            // nothing, because the count travels as a by-value argument.
+            // Computing `+1` at the old site would be wrong too: the bump is
+            // conditional on `bucket_append` succeeding, so a failed append
+            // would have us claim an event that does not exist.
+            //
+            // `rule_driven_events` is deliberately NOT reused as the persisted
+            // count -- it is the PRE-bump value and still gates the TCE-ERG-1
+            // no-silence receipt above. Redefining it would silently disable
+            // that carve-out for every command.
+            let exit_duration_ms = waiter_jobs
+                .get(job_id)
+                .and_then(|r| r.exit_info.as_ref().map(|e| e.duration_ms));
+            let exit_evidence = evidence_json(&final_metrics, exit_duration_ms, probe_id);
+            persist_job_receipt(
+                &waiter_store,
+                job_id,
+                waiter_bucket,
+                terminal_state,
+                receipt_exit_code,
+                final_metrics.events_emitted,
+                Some(&exit_evidence),
+                None,
+            );
 
             // Update the stored metrics for command_status callers.
             // The binding's `sifter`, `inline_rules`, and the receipt
@@ -1842,20 +1870,54 @@ impl CommandRuntime {
         let rec = self
             .job_record(job_id)
             .ok_or(CommandError::UnknownJob(job_id))?;
+        // spec 004 FR-004: the job ledger is SHARED across the combed, PTY and
+        // watch lanes, so this lookup finds jobs this runtime does not own. It
+        // used to answer for them anyway -- with zeroed counters, because their
+        // metrics live in another runtime's map, and with `restarted: false`
+        // positively asserting those zeros were observed live. Decline instead,
+        // so the caller routes to the lane that actually has the numbers.
+        //
+        // Guarding on `source_type` rather than live-map presence deliberately:
+        // there is a brief window during `start_combed_inner` where a combed job
+        // is in the ledger but not yet in `live`, and a presence guard would
+        // report a starting job as unknown.
+        if !matches!(
+            rec.config.source_type,
+            terminal_commander_core::SourceType::Process
+        ) {
+            return Err(CommandError::UnknownJob(job_id));
+        }
         let exited = rec.exit_info.is_some();
-        let (metrics, receipt) = self
-            .live
-            .read()
-            .get(&job_id)
-            .map(|b| {
-                let m = if exited {
-                    b.metrics.clone()
-                } else {
-                    b.metrics_live.lock().clone()
-                };
-                (m, b.receipt.clone())
-            })
-            .unwrap_or_default();
+        let live_metrics = self.live.read().get(&job_id).map(|b| {
+            let m = if exited {
+                b.metrics.clone()
+            } else {
+                b.metrics_live.lock().clone()
+            };
+            (m, b.receipt.clone())
+        });
+        // spec 004 review (composer MEDIUM, grok/kimi LOW): with no live
+        // binding there is NO observation to report, so certifying
+        // `unwrap_or_default()` zeros as `Observed` would be the precise
+        // over-claim this feature exists to delete. Decline instead and let
+        // the caller reconstruct from the durable receipt.
+        //
+        // The one exception is the documented start window: between the ledger
+        // registration and the live-map insert in `start_combed_inner` a job
+        // legitimately has no binding yet, and its zeros are TRUE -- nothing
+        // has happened. Declining there would report a starting job as
+        // unknown, so `Starting` keeps answering.
+        //
+        // Unreachable today because terminal bindings are never evicted
+        // (BACKLOG TCD-8); this is the guard that keeps TCD-8's eventual fix
+        // from silently reintroducing the defect.
+        let (metrics, receipt) = match live_metrics {
+            Some(found) => found,
+            None if rec.state == terminal_commander_core::JobState::Starting => {
+                (ProcessProbeMetrics::default(), None)
+            }
+            None => return Err(CommandError::UnknownJob(job_id)),
+        };
         Ok(CommandStatusResponse {
             job_id,
             bucket_id: rec.config.bucket_id,
@@ -1876,6 +1938,112 @@ impl CommandRuntime {
             // TC-B3: the live in-memory path is never a restart-reconstructed
             // result; the persisted-receipt fallback sets this in the handler.
             restarted: false,
+            // spec 004: this counter set came from a live probe, so the agent
+            // may treat every number here as a real observation.
+            outcome_trust: OutcomeTrust::Observed,
+        })
+    }
+
+    /// TC-B3 / spec 004 FR-015: reconstruct a terminal
+    /// [`CommandStatusResponse`] from a persisted job receipt, or `None` if no
+    /// receipt exists (the caller then decides between `JobLost` and
+    /// `UnknownJob`).
+    ///
+    /// Lives on the ENGINE, not the IPC handler, so both delivery shapes reach
+    /// it. `docs/EMBEDDING.md` documents `state.command.status` as the
+    /// embedder's status read, and the constitution's Additional Constraints
+    /// require both delivery shapes to terminate at the same authority. While
+    /// this lived in the handler an embedding host accumulated receipt rows it
+    /// had no supported typed API to read back.
+    ///
+    /// NOTE: this read performs a WRITE -- it stamps the receipt's restart
+    /// marker so the durable row records that it was read post-restart. That is
+    /// deliberate and best-effort; a failed stamp does not change the response.
+    ///
+    /// Counters come from the evidence captured at the terminal transition, so
+    /// a reconstructed pass is USABLE rather than merely labelled. Receipts
+    /// written before the evidence migration carry none, and that absence is
+    /// reported as-is rather than being disguised as zero observations.
+    #[must_use]
+    pub fn reconstructed_status(&self, job_id: JobId) -> Option<CommandStatusResponse> {
+        use terminal_commander_core::{BucketId, ProbeId};
+
+        let wire = job_id.to_wire_string();
+        let row = self.store.get_job_receipt(&wire).ok().flatten()?;
+
+        let state_enum = match row.terminal_state.as_str() {
+            "exited" => JobState::Exited,
+            "cancelled" => JobState::Cancelled,
+            // Any other persisted label (incl. "failed" and the conservative
+            // fallback) maps to Failed: a terminal, non-success state.
+            _ => JobState::Failed,
+        };
+        // Recover the bucket id from the receipt; a parse failure (corrupt row)
+        // falls back to a fresh id rather than failing the whole status read.
+        let bucket_id = BucketId::parse_wire(&row.bucket_id).unwrap_or_default();
+        let events_emitted = serde_json::from_str::<serde_json::Value>(&row.final_signal_counts)
+            .ok()
+            .and_then(|v| v.get("events_emitted").and_then(serde_json::Value::as_u64))
+            .unwrap_or(0);
+
+        // spec 004 FR-002: the evidence a live observer would have had. `None`
+        // for pre-migration rows.
+        let evidence = row
+            .metrics_json
+            .as_deref()
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok());
+        let num = |key: &str| -> u64 {
+            evidence
+                .as_ref()
+                .and_then(|v| v.get(key).and_then(serde_json::Value::as_u64))
+                .unwrap_or(0)
+        };
+        let duration_ms = evidence
+            .as_ref()
+            .and_then(|v| v.get("duration_ms").and_then(serde_json::Value::as_u64));
+        let probe_id = evidence
+            .as_ref()
+            .and_then(|v| v.get("probe_id").and_then(serde_json::Value::as_str))
+            .and_then(|s| ProbeId::parse_wire(s).ok())
+            .unwrap_or_default();
+
+        // spec 004 D1: abandonment rides the trust indicator. The terminal
+        // state stays the truthful `Cancelled` and the exit code stays absent --
+        // an abandoned job did not fail, and reporting it as a failure would be
+        // the exact false negative this feature exists to remove.
+        let abandoned =
+            row.end_cause.as_deref() == Some(terminal_commander_store::ABANDONED_END_CAUSE);
+        let (state_enum, exit_code, outcome_trust) = if abandoned {
+            (JobState::Cancelled, None, OutcomeTrust::Abandoned)
+        } else {
+            (state_enum, row.exit_code, OutcomeTrust::Reconstructed)
+        };
+
+        let _ = self.store.mark_job_receipt_restarted(&wire);
+
+        Some(CommandStatusResponse {
+            job_id,
+            bucket_id,
+            probe_id,
+            state: state_enum,
+            frames_total: num("frames_total"),
+            frames_stdout: num("frames_stdout"),
+            frames_stderr: num("frames_stderr"),
+            bytes_total: num("bytes_total"),
+            events_emitted,
+            frames_suppressed: num("frames_suppressed"),
+            frames_suppressed_progress: num("frames_suppressed_progress"),
+            frames_suppressed_dedupe: num("frames_suppressed_dedupe"),
+            exit_code,
+            signal: None,
+            duration_ms,
+            // The no-silence frame tail is memory-only by design (spec D2:
+            // constitution III bars raw frames from persistent output). Its
+            // absence here does NOT mean the command produced no output.
+            receipt: None,
+            // Derived, never set independently.
+            restarted: outcome_trust != OutcomeTrust::Observed,
+            outcome_trust,
         })
     }
 
@@ -1922,21 +2090,64 @@ async fn drive_to_exit(mut probe: ProcessProbe) -> (ProcessProbeMetrics, ProbeOu
     (probe.metrics(), outcome)
 }
 
-/// TC-B3 (FR-027): persist a compact job receipt on a terminal transition.
+/// Build the bounded evidence object persisted alongside a job receipt
+/// (spec 004 FR-002).
+///
+/// NUMERIC AND IDENTIFIER DATA ONLY. Constitution III bars raw frames from
+/// persistent output, which is why the no-silence tail is deliberately absent
+/// here (spec decision D2). Every value below is either a counter or an opaque
+/// id, so no escaping is required and the string cannot carry stream content.
+pub(crate) fn evidence_json(
+    metrics: &ProcessProbeMetrics,
+    duration_ms: Option<u64>,
+    probe_id: ProbeId,
+) -> String {
+    let duration = duration_ms.map_or_else(|| "null".to_owned(), |d| d.to_string());
+    format!(
+        "{{\"frames_total\":{},\"frames_stdout\":{},\"frames_stderr\":{},\
+         \"bytes_total\":{},\"frames_suppressed\":{},\
+         \"frames_suppressed_progress\":{},\"frames_suppressed_dedupe\":{},\
+         \"duration_ms\":{},\"probe_id\":\"{}\"}}",
+        metrics.frames_total,
+        metrics.frames_stdout,
+        metrics.frames_stderr,
+        metrics.bytes_total,
+        metrics.frames_suppressed,
+        metrics.frames_suppressed_progress,
+        metrics.frames_suppressed_dedupe,
+        duration,
+        probe_id.to_wire_string(),
+    )
+}
+
+/// TC-B3 (FR-027) / spec 004: persist a job receipt on a terminal transition.
 ///
 /// Maps the terminal [`JobState`] to a stable lowercase string, encodes the
-/// rule-driven event count as a small JSON object, and writes through the
+/// event count and the bounded evidence object, and writes through the
 /// single-writer store actor. A write failure is logged-and-dropped: the
 /// receipt is a post-restart durability backstop, never a correctness
 /// dependency of the live exit path, so a store hiccup must not abort the
 /// waiter or corrupt the in-memory terminal state.
-fn persist_job_receipt(
+///
+/// `events_emitted` MUST be the count a live observer of the same run would
+/// see. On the natural-exit path that means the value AFTER the lifecycle
+/// append; on the `stop()` path no append occurs, so the reap-time count is
+/// already correct. Passing the pre-append value on the natural-exit path
+/// would bake a permanent off-by-one into every reconstructed status.
+///
+/// `end_cause` is `Some("abandoned")` only when the job was ended by daemon
+/// shutdown or stale replacement rather than reaching its own conclusion. The
+/// terminal state stays the truthful `cancelled` (spec decision D1).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn persist_job_receipt(
     store: &StoreClient,
     job_id: JobId,
     bucket_id: BucketId,
     state: JobState,
     exit_code: Option<i32>,
-    rule_driven_events: u64,
+    events_emitted: u64,
+    metrics_json: Option<&str>,
+    end_cause: Option<&str>,
 ) {
     let terminal_state = match state {
         JobState::Exited => "exited",
@@ -1947,13 +2158,15 @@ fn persist_job_receipt(
         JobState::Starting => "starting",
         JobState::Running => "running",
     };
-    let counts = format!("{{\"events_emitted\":{rule_driven_events}}}");
+    let counts = format!("{{\"events_emitted\":{events_emitted}}}");
     if let Err(e) = store.record_job_receipt(
         &job_id.to_wire_string(),
         &bucket_id.to_wire_string(),
         terminal_state,
         exit_code,
         &counts,
+        metrics_json,
+        end_cause,
     ) {
         // Honest degradation: the live job is already terminal and tracked in
         // memory; only the durable backstop failed. Surface it in the log,

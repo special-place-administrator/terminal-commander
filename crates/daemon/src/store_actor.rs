@@ -99,8 +99,10 @@ pub enum StoreOp {
     },
     /// `EventStore::get_workspace_snapshot(snapshot_id)` -> optional row
     GetWorkspaceSnapshot { snapshot_id: String },
-    /// `EventStore::ensure_job_receipts()` (P1 / TC-B3)
-    EnsureJobReceipts,
+    /// `EventStore::ensure_outcome_evidence()` (spec 004). Supersedes the
+    /// V0007-only ensure: it runs V0007, V0003 and V0008, so the post-restart
+    /// read never races a lazy migration and the evidence columns always exist.
+    EnsureOutcomeEvidence,
     /// `EventStore::record_job_receipt(...)` on a terminal transition.
     RecordJobReceipt {
         job_id: String,
@@ -108,6 +110,10 @@ pub enum StoreOp {
         terminal_state: String,
         exit_code: Option<i32>,
         final_signal_counts: String,
+        /// Bounded numeric/identifier evidence. Never frame text.
+        metrics_json: Option<String>,
+        /// Why the job ended when not self-evident; today only `abandoned`.
+        end_cause: Option<String>,
     },
     /// `EventStore::get_job_receipt(job_id)` -> optional row (post-restart
     /// fallback read).
@@ -115,6 +121,8 @@ pub enum StoreOp {
     /// `EventStore::mark_job_receipt_restarted(job_id)` -> stamp the
     /// restart marker on a post-restart read.
     MarkJobReceiptRestarted { job_id: String },
+    /// `EventStore::job_start_recorded(job_id)` -> bool (spec 004 FR-009).
+    JobStartRecorded { job_id: String },
     /// Drain queue, run `wal_checkpoint(FULL)`, exit thread.
     Shutdown,
 }
@@ -425,17 +433,25 @@ impl StoreClient {
         }
     }
 
-    /// Ensure the job-receipt schema (V0007) exists. Idempotent. Called at
-    /// bootstrap so the post-restart status fallback read never races a
-    /// lazy migration.
-    pub fn ensure_job_receipts(&self) -> Result<(), EventStoreError> {
-        match self.call(StoreOp::EnsureJobReceipts)? {
+    /// Ensure the receipt schema plus outcome evidence (V0007 + V0003 + V0008)
+    /// exists. Idempotent. Called at bootstrap so the post-restart status
+    /// fallback read never races a lazy migration.
+    pub fn ensure_outcome_evidence(&self) -> Result<(), EventStoreError> {
+        match self.call(StoreOp::EnsureOutcomeEvidence)? {
             StoreReply::Unit => Ok(()),
-            other => Err(unexpected_store_reply("EnsureJobReceipts", &other)),
+            other => Err(unexpected_store_reply("EnsureOutcomeEvidence", &other)),
         }
     }
 
-    /// Persist a job receipt on a terminal transition (TC-B3).
+    /// Persist a job receipt on a terminal transition (TC-B3 / spec 004).
+    ///
+    /// `metrics_json` carries the evidence a live observer would have had.
+    /// It MUST be numeric and identifier data only -- constitution III bars
+    /// raw frames from persistent output.
+    // Mirrors `EventStore::record_job_receipt`'s flat row shape one-for-one;
+    // the `StoreOp` it builds uses NAMED fields, so the actor path itself
+    // cannot transpose arguments.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_job_receipt(
         &self,
         job_id: &str,
@@ -443,6 +459,8 @@ impl StoreClient {
         terminal_state: &str,
         exit_code: Option<i32>,
         final_signal_counts: &str,
+        metrics_json: Option<&str>,
+        end_cause: Option<&str>,
     ) -> Result<(), EventStoreError> {
         match self.call(StoreOp::RecordJobReceipt {
             job_id: job_id.to_owned(),
@@ -450,6 +468,8 @@ impl StoreClient {
             terminal_state: terminal_state.to_owned(),
             exit_code,
             final_signal_counts: final_signal_counts.to_owned(),
+            metrics_json: metrics_json.map(str::to_owned),
+            end_cause: end_cause.map(str::to_owned),
         })? {
             StoreReply::Unit => Ok(()),
             other => Err(unexpected_store_reply("RecordJobReceipt", &other)),
@@ -476,6 +496,18 @@ impl StoreClient {
         })? {
             StoreReply::Unit => Ok(()),
             other => Err(unexpected_store_reply("MarkJobReceiptRestarted", &other)),
+        }
+    }
+
+    /// Did the daemon durably record this job STARTING? Distinguishes a lost
+    /// job from an unrecognised id (spec 004 FR-009). Best-effort: `false`
+    /// means "no evidence", never proof the job never existed.
+    pub fn job_start_recorded(&self, job_id: &str) -> Result<bool, EventStoreError> {
+        match self.call(StoreOp::JobStartRecorded {
+            job_id: job_id.to_owned(),
+        })? {
+            StoreReply::Bool(found) => Ok(found),
+            other => Err(unexpected_store_reply("JobStartRecorded", &other)),
         }
     }
 }
@@ -524,6 +556,10 @@ fn drain_remaining(store: &mut EventStore, rx: &Receiver<StoreMsg>) {
     }
 }
 
+// One flat arm per `StoreOp` variant. Length tracks the op count, not
+// complexity; splitting it would scatter the 1:1 op-to-method mapping that
+// makes the actor auditable.
+#[allow(clippy::too_many_lines)]
 fn execute(store: &mut EventStore, op: StoreOp) -> Result<StoreReply, EventStoreError> {
     match op {
         StoreOp::EnsureAudit => store.ensure_audit().map(|()| StoreReply::Unit),
@@ -593,13 +629,17 @@ fn execute(store: &mut EventStore, op: StoreOp) -> Result<StoreReply, EventStore
         StoreOp::GetWorkspaceSnapshot { snapshot_id } => store
             .get_workspace_snapshot(&snapshot_id)
             .map(StoreReply::OptionalSnapshot),
-        StoreOp::EnsureJobReceipts => store.ensure_job_receipts().map(|()| StoreReply::Unit),
+        StoreOp::EnsureOutcomeEvidence => {
+            store.ensure_outcome_evidence().map(|()| StoreReply::Unit)
+        }
         StoreOp::RecordJobReceipt {
             job_id,
             bucket_id,
             terminal_state,
             exit_code,
             final_signal_counts,
+            metrics_json,
+            end_cause,
         } => store
             .record_job_receipt(
                 &job_id,
@@ -607,6 +647,8 @@ fn execute(store: &mut EventStore, op: StoreOp) -> Result<StoreReply, EventStore
                 &terminal_state,
                 exit_code,
                 &final_signal_counts,
+                metrics_json.as_deref(),
+                end_cause.as_deref(),
             )
             .map(|()| StoreReply::Unit),
         StoreOp::GetJobReceipt { job_id } => store
@@ -615,6 +657,9 @@ fn execute(store: &mut EventStore, op: StoreOp) -> Result<StoreReply, EventStore
         StoreOp::MarkJobReceiptRestarted { job_id } => store
             .mark_job_receipt_restarted(&job_id)
             .map(|()| StoreReply::Unit),
+        StoreOp::JobStartRecorded { job_id } => {
+            store.job_start_recorded(&job_id).map(StoreReply::Bool)
+        }
         StoreOp::Shutdown => Ok(StoreReply::Unit),
     }
 }

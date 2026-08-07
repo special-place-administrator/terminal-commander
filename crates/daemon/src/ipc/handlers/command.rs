@@ -162,88 +162,42 @@ pub(in crate::ipc::server) fn handle_command_status(
     state: &Arc<DaemonState>,
     params: &CommandStatusParams,
 ) -> Result<IpcResponse, IpcError> {
-    match state.command.status(params.job_id) {
-        Ok(resp) => Ok(IpcResponse::CommandStatus(resp)),
-        // TC-B3 (FR-027): the in-memory job is gone. Before returning a bare
-        // error, consult the persisted receipt: if this job ran (and reached a
-        // terminal state) before a daemon restart, return a restart-marked
-        // terminal result instead of an error. Honest degradation
-        // (constitution VII): a known terminal outcome from disk beats a bare
-        // "unknown job".
-        Err(crate::command::CommandError::UnknownJob(job_id)) => {
-            restart_marked_status_from_receipt(state, job_id).map_or_else(
-                || {
-                    Err(map_command_error(crate::command::CommandError::UnknownJob(
-                        job_id,
-                    )))
-                },
-                |resp| Ok(IpcResponse::CommandStatus(resp)),
-            )
-        }
-        Err(e) => Err(map_command_error(e)),
+    // 1. Ask the lane that OWNS this job. The ledger is shared across lanes, so
+    //    the combed runtime declines jobs whose metrics live elsewhere; a PTY or
+    //    watch job answers here with REAL counters. Constitution VII forbids
+    //    discarding a live job behind a bare error, and `command_status` is
+    //    today the only surface exposing a finished PTY job's exit code at all.
+    if let Some(resp) = state.live_lane_status(params.job_id) {
+        return Ok(IpcResponse::CommandStatus(resp));
     }
-}
+    let job_id = params.job_id;
 
-/// TC-B3: reconstruct a restart-marked terminal [`CommandStatusResponse`]
-/// from a persisted job receipt, or `None` if no receipt exists (then the
-/// caller returns the original `UnknownJob` error). Stamps the receipt's
-/// restart marker as a side effect so the persisted row records that it was
-/// read post-restart. The live counters are zero (the in-memory probe
-/// metrics did not survive the restart); `restarted: true` tells the agent
-/// the terminal `state`/`exit_code` are authoritative-from-disk.
-fn restart_marked_status_from_receipt(
-    state: &Arc<DaemonState>,
-    job_id: terminal_commander_core::JobId,
-) -> Option<crate::ipc::protocol::CommandStatusResponse> {
-    use terminal_commander_core::{BucketId, JobState, ProbeId};
+    // 2. No live owner. Consult the persisted receipt: a known terminal outcome
+    //    from disk beats a bare "unknown job" (constitution VII honest
+    //    degradation).
+    if let Some(resp) = state.command.reconstructed_status(job_id) {
+        return Ok(IpcResponse::CommandStatus(resp));
+    }
 
+    // 3. No receipt exists. Did the daemon durably record this job STARTING? If
+    //    so it is LOST: it began and never reached a recorded terminal
+    //    transition, which is a diagnosis rather than the "never heard of it"
+    //    that `UnknownJob` implies.
+    //
+    //    Fails safe (spec FR-011). Audit emits are dropped on failure at the
+    //    call site, so absence is not proof; an errored or empty lookup degrades
+    //    to `UnknownJob` and NEVER to a terminal outcome. The failure direction
+    //    is one-way by construction.
     let wire = job_id.to_wire_string();
-    let row = state.store.get_job_receipt(&wire).ok().flatten()?;
-
-    let state_enum = match row.terminal_state.as_str() {
-        "exited" => JobState::Exited,
-        "cancelled" => JobState::Cancelled,
-        // Any other persisted label (incl. "failed" and the conservative
-        // fallback) maps to Failed: a terminal, non-success state.
-        _ => JobState::Failed,
-    };
-    // Recover the bucket id from the receipt; a parse failure (corrupt row)
-    // falls back to a fresh id rather than failing the whole status read.
-    let bucket_id = BucketId::parse_wire(&row.bucket_id).unwrap_or_default();
-    // The events_emitted count was persisted in the small JSON object; a
-    // parse miss is non-fatal (counts default to 0).
-    let events_emitted = serde_json::from_str::<serde_json::Value>(&row.final_signal_counts)
-        .ok()
-        .and_then(|v| v.get("events_emitted").and_then(serde_json::Value::as_u64))
-        .unwrap_or(0);
-
-    // Best-effort: stamp the restart marker on the durable row. A failure
-    // here does not change the response we return (it already carries
-    // `restarted: true`).
-    let _ = state.store.mark_job_receipt_restarted(&wire);
-
-    Some(crate::ipc::protocol::CommandStatusResponse {
+    if state.store.job_start_recorded(&wire).unwrap_or(false) {
+        return Err(IpcError::new(
+            IpcErrorCode::JobLost,
+            format!("job {wire} started but never recorded a terminal transition"),
+        ));
+    }
+    Err(map_command_error(crate::command::CommandError::UnknownJob(
         job_id,
-        bucket_id,
-        // The probe is gone post-restart; a fresh id is a truthful "no live
-        // probe" placeholder (context/tail reads will report not-found).
-        probe_id: ProbeId::default(),
-        state: state_enum,
-        frames_total: 0,
-        frames_stdout: 0,
-        frames_stderr: 0,
-        bytes_total: 0,
-        events_emitted,
-        frames_suppressed: 0,
-        frames_suppressed_progress: 0,
-        frames_suppressed_dedupe: 0,
-        exit_code: row.exit_code,
-        signal: None,
-        duration_ms: None,
-        // The no-silence frame tail did not survive the restart.
-        receipt: None,
-        restarted: true,
-    })
+    )))
 }
 
 pub(in crate::ipc::server) fn handle_command_output_tail(
@@ -292,4 +246,83 @@ pub(in crate::ipc::server) fn handle_command_output_tail(
         truncated_bytes,
         evicted_frames: tail.evicted_frames,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use terminal_commander_core::JobId;
+    use terminal_commander_store::AuditEntry;
+
+    use super::{CommandStatusParams, IpcErrorCode, handle_command_status};
+    use crate::audit::AuditSink;
+    use crate::config::DaemonConfig;
+    use crate::state::DaemonState;
+
+    fn tmp_data_dir(tag: &str) -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut p = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        p.push(format!(
+            "tc-joblost-{tag}-{}-{nanos}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        p
+    }
+
+    /// spec 004 FR-009: a job the daemon durably recorded STARTING, with no
+    /// receipt, is LOST -- a diagnosis, not "never heard of it".
+    ///
+    /// This is the wire-level half of the guarantee; the discrimination logic
+    /// itself is covered in `tests/status_lost_detection.rs`.
+    #[test]
+    fn a_started_job_with_no_receipt_reports_job_lost() {
+        let data = tmp_data_dir("lost");
+        let state = std::sync::Arc::new(
+            DaemonState::bootstrap(DaemonConfig::defaults_in(&data)).expect("bootstrap"),
+        );
+
+        let job_id = JobId::new();
+        state
+            .audit
+            .emit(&AuditEntry::new(
+                "command_start",
+                job_id.to_wire_string(),
+                "allow",
+            ))
+            .expect("audit emit");
+
+        let err = handle_command_status(&state, &CommandStatusParams { job_id })
+            .expect_err("a lost job must not return a status");
+        assert_eq!(
+            err.code,
+            IpcErrorCode::JobLost,
+            "a started-but-unfinished job is LOST, not unknown"
+        );
+
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// An identifier with no durable trace at all stays `UnknownJob`. The lost
+    /// case must NARROW that error, not swallow it.
+    #[test]
+    fn an_identifier_with_no_trace_reports_unknown_job() {
+        let data = tmp_data_dir("unknown");
+        let state = std::sync::Arc::new(
+            DaemonState::bootstrap(DaemonConfig::defaults_in(&data)).expect("bootstrap"),
+        );
+
+        let err = handle_command_status(
+            &state,
+            &CommandStatusParams {
+                job_id: JobId::new(),
+            },
+        )
+        .expect_err("an unknown id must not return a status");
+        assert_eq!(err.code, IpcErrorCode::UnknownJob);
+
+        let _ = std::fs::remove_dir_all(&data);
+    }
 }

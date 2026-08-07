@@ -153,6 +153,11 @@ pub struct WatchRuntime {
     /// Bucket source side-table (subscriptions MUST-ADD #2). Recorded
     /// at `start` immediately after `bucket_create`.
     sources: Arc<crate::subscriptions::source::BucketSourceTable>,
+    /// Single-writer store actor. spec 004 review (kimi-k3 HIGH-1): the watch
+    /// lane persists a receipt on its terminal transitions, mirroring the
+    /// combed and PTY lanes, so a stopped or errored watch stays readable
+    /// instead of falling through to a false `JobLost`.
+    store: crate::store_actor::StoreClient,
 }
 
 impl std::fmt::Debug for WatchRuntime {
@@ -165,6 +170,9 @@ impl std::fmt::Debug for WatchRuntime {
 
 impl WatchRuntime {
     #[must_use]
+    // spec 004: `new` gained the store client so the watch lane can persist a
+    // receipt on its terminal transitions, matching the combed and PTY lanes.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         router: Arc<Router>,
         rings: Arc<ContextRingManager>,
@@ -173,6 +181,7 @@ impl WatchRuntime {
         policy: PolicyEngine,
         activation: Arc<ActivationRegistry>,
         sources: Arc<crate::subscriptions::source::BucketSourceTable>,
+        store: crate::store_actor::StoreClient,
     ) -> Self {
         let profile_label = match policy.profile {
             PolicyProfile::DeveloperLocal => "developer_local".to_owned(),
@@ -191,6 +200,7 @@ impl WatchRuntime {
             live: Arc::new(RwLock::new(HashMap::default())),
             activation,
             sources,
+            store,
         }
     }
 
@@ -282,6 +292,26 @@ impl WatchRuntime {
             let sink_metrics = binding.metrics.lock().clone();
             let metrics = combine_file_metrics(&probe_metrics, &sink_metrics);
             let _ = self.jobs.finish(watch_id, Some(1), None);
+            // spec 004 review (kimi-k3 HIGH-1): the reap removes the live
+            // binding, so without a receipt this errored watch becomes a
+            // false `JobLost` -- reporting "the daemon lost track" for a probe
+            // whose failure the daemon observed and recorded. A real terminal
+            // transition, so `end_cause` stays None.
+            let duration_ms = self
+                .jobs
+                .get(watch_id)
+                .and_then(|r| r.exit_info.as_ref().map(|e| e.duration_ms));
+            let evidence = watch_evidence_json(&metrics, duration_ms, binding.probe_id);
+            crate::command::persist_job_receipt(
+                &self.store,
+                watch_id,
+                binding.bucket_id,
+                terminal_commander_core::JobState::Failed,
+                Some(1),
+                metrics.events_emitted,
+                Some(&evidence),
+                None,
+            );
             self.audit(
                 "file_watch_exit",
                 &watch_id.to_wire_string(),
@@ -508,10 +538,32 @@ impl WatchRuntime {
         }
         let sink_snap = b.metrics.lock().clone();
         let metrics = combine_file_metrics(&probe_metrics, &sink_snap);
-        // Mark the JobManager record finished so bucket_wait /
-        // command_status (if anyone reads it) see a non-Running
-        // state. exit_code=0 because the cancel is a clean stop.
-        let _ = self.jobs.finish(watch_id, Some(0), None);
+        // An operator stop is a CANCELLATION, not a clean exit.
+        //
+        // spec 004 review (grok BLOCKER-evidence / kimi-k3 HIGH-1): this used
+        // to call `finish(watch_id, Some(0), None)` with the rationale "the
+        // cancel is a clean stop". That fabricated a successful exit status
+        // for a job nobody ran to completion -- exactly the false-green class
+        // this feature exists to delete. Record the truthful cancellation and
+        // let the receipt carry the real counters instead.
+        let _ = self.jobs.cancel(watch_id);
+        let duration_ms = self
+            .jobs
+            .get(watch_id)
+            .and_then(|r| r.exit_info.as_ref().map(|e| e.duration_ms));
+        let evidence = watch_evidence_json(&metrics, duration_ms, b.probe_id);
+        crate::command::persist_job_receipt(
+            &self.store,
+            watch_id,
+            b.bucket_id,
+            terminal_commander_core::JobState::Cancelled,
+            // A cancelled watch has no exit status. Never invent one.
+            None,
+            metrics.events_emitted,
+            Some(&evidence),
+            // An operator stop is an ordinary cancel, NOT an abandonment.
+            None,
+        );
         self.audit(
             "file_watch_stop",
             &watch_id.to_wire_string(),
@@ -562,6 +614,62 @@ impl WatchRuntime {
                 (*wid, b.bucket_id, b.probe_id, b.path.clone(), m)
             })
             .collect()
+    }
+
+    /// spec 004 FR-004: answer a `command_status` read for a watch THIS lane
+    /// owns, with real counters.
+    ///
+    /// The job ledger is shared across lanes, so `CommandRuntime::status` used
+    /// to find watch jobs and report zeroes for them while asserting they were
+    /// observed live. Returns `None` when this lane does not own the id.
+    #[must_use]
+    pub fn status(
+        &self,
+        watch_id: JobId,
+    ) -> Option<terminal_commander_ipc::protocol::CommandStatusResponse> {
+        use terminal_commander_ipc::protocol::OutcomeTrust;
+
+        let (bucket_id, probe_id, metrics) = {
+            let g = self.live.read();
+            let b = g.get(&watch_id)?;
+            // Same non-blocking read shape as `list()`; a status read must
+            // never block on a busy probe.
+            let m = b.cancel.try_lock().map_or_else(
+                || b.metrics.lock().clone(),
+                |guard| {
+                    let probe_metrics = guard
+                        .as_ref()
+                        .map_or_else(FileProbeMetrics::default, FileProbe::metrics);
+                    let sink_snap = b.metrics.lock().clone();
+                    combine_file_metrics(&probe_metrics, &sink_snap)
+                },
+            );
+            (b.bucket_id, b.probe_id, m)
+        };
+        let rec = self.jobs.get(watch_id)?;
+        Some(terminal_commander_ipc::protocol::CommandStatusResponse {
+            job_id: watch_id,
+            bucket_id,
+            probe_id,
+            state: rec.state,
+            frames_total: metrics.frames_total,
+            // A file watch reads ONE stream; there is no stdout/stderr split to
+            // report. Attributing the frames to stdout is truthful.
+            frames_stdout: metrics.frames_total,
+            frames_stderr: 0,
+            bytes_total: metrics.bytes_total,
+            events_emitted: metrics.events_emitted,
+            frames_suppressed: metrics.frames_suppressed,
+            frames_suppressed_progress: metrics.frames_suppressed_progress,
+            frames_suppressed_dedupe: metrics.frames_suppressed_dedupe,
+            exit_code: rec.exit_info.as_ref().and_then(|e| e.exit_code),
+            signal: rec.exit_info.as_ref().and_then(|e| e.signal.clone()),
+            duration_ms: rec.exit_info.as_ref().map(|e| e.duration_ms),
+            // The no-silence receipt is a combed-lane construct.
+            receipt: None,
+            restarted: false,
+            outcome_trust: OutcomeTrust::Observed,
+        })
     }
 
     /// Recompute per-watch sifters from the current scoped activation
@@ -683,6 +791,37 @@ fn combine_file_metrics(probe: &FileProbeMetrics, snapshot: &FileProbeMetrics) -
         events_emitted: probe.events_emitted.max(snapshot.events_emitted),
         ..probe.clone()
     }
+}
+
+/// Build the bounded evidence object persisted alongside a watch job receipt
+/// (spec 004 FR-002).
+///
+/// NUMERIC AND IDENTIFIER DATA ONLY -- constitution III bars raw frames from
+/// persistent output, and a watched file is arbitrary user content, so no
+/// frame text is written here under any circumstance.
+///
+/// A file watch is ONE stream, so there is no stdout/stderr split to record;
+/// the reader attributes `frames_total` to stdout, matching `status()`.
+fn watch_evidence_json(
+    metrics: &FileProbeMetrics,
+    duration_ms: Option<u64>,
+    probe_id: ProbeId,
+) -> String {
+    let duration = duration_ms.map_or_else(|| "null".to_owned(), |d| d.to_string());
+    format!(
+        "{{\"frames_total\":{},\"frames_stdout\":{},\"frames_stderr\":0,\
+         \"bytes_total\":{},\"frames_suppressed\":{},\
+         \"frames_suppressed_progress\":{},\"frames_suppressed_dedupe\":{},\
+         \"duration_ms\":{},\"probe_id\":\"{}\"}}",
+        metrics.frames_total,
+        metrics.frames_total,
+        metrics.bytes_total,
+        metrics.frames_suppressed,
+        metrics.frames_suppressed_progress,
+        metrics.frames_suppressed_dedupe,
+        duration,
+        probe_id.to_wire_string(),
+    )
 }
 
 #[cfg(test)]

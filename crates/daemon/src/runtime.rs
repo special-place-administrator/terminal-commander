@@ -374,6 +374,9 @@ pub async fn run_ipc_server(config: DaemonConfig) -> Result<(), RuntimeError> {
     // exiting inside the shutdown window otherwise loses its final
     // command_exited event + audit row (D7).
     state.command.drain_lifecycle_tasks().await;
+    // spec 004 FR-012: after the drain, anything still non-terminal was ended
+    // BY this shutdown. Record it while the store is still writable.
+    state.record_abandoned_jobs();
     shutdown_store(&state);
     terminal_commander_supervisor::pidfile::remove_pidfile(&state_dir);
     tracing::info!("IPC server exited cleanly.");
@@ -450,6 +453,7 @@ pub async fn run_ipc_server(config: DaemonConfig) -> Result<(), RuntimeError> {
     // exiting inside the shutdown window otherwise loses its final
     // command_exited event + audit row (D7).
     state.command.drain_lifecycle_tasks().await;
+    state.record_abandoned_jobs();
     shutdown_store(state.as_ref());
     terminal_commander_supervisor::pidfile::remove_pidfile(&state_dir);
     tracing::info!("IPC server exited cleanly.");

@@ -544,10 +544,70 @@ enum ProbeResponse {
         #[serde(default)]
         version: String,
     },
+    /// spec 004 FR-013 ack: how many in-flight jobs were recorded abandoned.
+    QuiesceAck { recorded: u32 },
     // A well-formed envelope carrying some other method is a daemon
     // answering the wrong question — still "not our health handshake".
     #[serde(other)]
     Other,
+}
+
+/// One-shot request frame the probe writes. `correlation_id: 0` is fine --
+/// the probe does not multiplex. Matches the TC37 wire schema exactly.
+const HEALTH_REQUEST_JSON: &[u8] = br#"{"correlation_id":0,"request":{"method":"health"}}"#;
+
+/// spec 004 FR-013: ask a daemon about to be replaced to record its in-flight
+/// jobs as abandoned. Same one-shot shape as the health probe.
+const QUIESCE_REQUEST_JSON: &[u8] =
+    br#"{"correlation_id":0,"request":{"method":"quiesce_for_replace"}}"#;
+
+/// Write one length-prefixed request frame and read one length-prefixed
+/// response frame. Shared by every one-shot supervisor handshake so the
+/// framing rules (4-byte big-endian prefix, bounded payload) live in ONE place.
+///
+/// Any I/O error, zero-length frame, or oversize frame yields `None`. The
+/// caller is responsible for bounding the whole call with a timeout.
+async fn oneshot_frame<S>(stream: &mut S, request_json: &[u8]) -> Option<Vec<u8>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let len = u32::try_from(request_json.len()).ok()?;
+    stream.write_all(&len.to_be_bytes()).await.ok()?;
+    stream.write_all(request_json).await.ok()?;
+    stream.flush().await.ok()?;
+
+    let mut len_buf = [0_u8; 4];
+    stream.read_exact(&mut len_buf).await.ok()?;
+    let resp_len = u32::from_be_bytes(len_buf) as usize;
+    if resp_len == 0 || resp_len > PROBE_MAX_FRAME_BYTES {
+        return None;
+    }
+    let mut payload = vec![0_u8; resp_len];
+    stream.read_exact(&mut payload).await.ok()?;
+    Some(payload)
+}
+
+/// Run the one-shot `quiesce_for_replace` handshake over a connected stream.
+///
+/// Returns how many in-flight jobs the daemon recorded as abandoned. `None`
+/// means the daemon did not answer, answered something else, or predates the
+/// verb -- all of which fall back to today's behaviour at the call site.
+async fn quiesce_handshake<S>(mut stream: S) -> Option<u32>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let payload = oneshot_frame(&mut stream, QUIESCE_REQUEST_JSON).await?;
+    match serde_json::from_slice::<ProbeResponseEnvelope>(&payload) {
+        Ok(ProbeResponseEnvelope {
+            result:
+                ProbeResult::Ok {
+                    response: ProbeResponse::QuiesceAck { recorded },
+                },
+        }) => Some(recorded),
+        _ => None,
+    }
 }
 
 /// Run the one-shot `health` handshake over an already-connected stream:
@@ -562,26 +622,7 @@ async fn health_handshake<S>(mut stream: S) -> Option<ProbeHealth>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    // Request frame. correlation_id 0 is fine: the probe is one-shot and
-    // does not multiplex. Payload matches the TC37 wire schema exactly:
-    // {"correlation_id":0,"request":{"method":"health"}}.
-    const REQUEST_JSON: &[u8] = br#"{"correlation_id":0,"request":{"method":"health"}}"#;
-    let len = u32::try_from(REQUEST_JSON.len()).ok()?;
-    stream.write_all(&len.to_be_bytes()).await.ok()?;
-    stream.write_all(REQUEST_JSON).await.ok()?;
-    stream.flush().await.ok()?;
-
-    // Response frame: 4-byte big-endian length prefix, then the payload.
-    let mut len_buf = [0_u8; 4];
-    stream.read_exact(&mut len_buf).await.ok()?;
-    let resp_len = u32::from_be_bytes(len_buf) as usize;
-    if resp_len == 0 || resp_len > PROBE_MAX_FRAME_BYTES {
-        return None;
-    }
-    let mut payload = vec![0_u8; resp_len];
-    stream.read_exact(&mut payload).await.ok()?;
+    let payload = oneshot_frame(&mut stream, HEALTH_REQUEST_JSON).await?;
 
     match serde_json::from_slice::<ProbeResponseEnvelope>(&payload) {
         Ok(ProbeResponseEnvelope {
@@ -687,6 +728,73 @@ async fn probe_endpoint_health_with_timeout(
     // Bound EVERYTHING: connect + write + read. A silent peer that never
     // answers must make the probe return None, never hang.
     (tokio::time::timeout(timeout, handshake).await).unwrap_or(None)
+}
+
+/// spec 004 FR-013: ask the daemon at `endpoint` to record its in-flight jobs
+/// as abandoned before it is replaced.
+///
+/// Same connect/bound shape as the health probe -- only the request and the
+/// parsed reply differ; the framing and envelope parsing are shared via
+/// [`oneshot_frame`]. Returns the recorded count, or `None` for any daemon that
+/// is unreachable, silent, or predates the verb.
+///
+/// The caller MUST treat `None` as "carry on and kill it anyway": quiescing is
+/// a courtesy that must never be able to block a replacement.
+async fn quiesce_endpoint_with_timeout(endpoint: &Endpoint, timeout: Duration) -> Option<u32> {
+    let handshake = async {
+        match endpoint {
+            #[cfg(unix)]
+            Endpoint::UnixSocket { path } => match tokio::net::UnixStream::connect(path).await {
+                Ok(stream) => quiesce_handshake(stream).await,
+                Err(_) => None,
+            },
+            #[cfg(not(unix))]
+            Endpoint::UnixSocket { .. } => None,
+            #[cfg(windows)]
+            Endpoint::WindowsPipe { name } => {
+                // ClientOptions::new().open is synchronous; same tokio
+                // contract caveat as the blocking I/O in ensure_daemon
+                // step 2 (acceptable for Phase 3, revisit if probed in a
+                // hot path). The returned NamedPipeClient implements the
+                // tokio async I/O traits, so the same handshake applies.
+                //
+                // ERROR_PIPE_BUSY means the daemon EXISTS but every pipe
+                // instance is busy serving another client. That is NOT
+                // "down" -- collapsing it to None would misreport a live
+                // daemon as unavailable. Retry briefly (the daemon's
+                // accept loop recreates an instance after each accept);
+                // the outer PROBE_TIMEOUT still bounds the whole probe.
+                // Any other open error IS a genuine unreachable peer.
+                use tokio::net::windows::named_pipe::ClientOptions;
+                loop {
+                    match ClientOptions::new().open(name.as_str()) {
+                        Ok(stream) => break quiesce_handshake(stream).await,
+                        Err(e)
+                            if pipe_open_error_is_busy(&e) || pipe_open_error_is_not_found(&e) =>
+                        {
+                            tokio::time::sleep(Duration::from_millis(PIPE_BUSY_RETRY_DELAY_MS))
+                                .await;
+                            // Loop: the outer timeout caps both transient
+                            // named-pipe gap shapes.
+                        }
+                        Err(_) => break None,
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            Endpoint::WindowsPipe { .. } => None,
+        }
+    };
+
+    // Bound EVERYTHING: connect + write + read. A silent peer that never
+    // answers must make the probe return None, never hang.
+    (tokio::time::timeout(timeout, handshake).await).unwrap_or(None)
+}
+
+/// Quiesce a daemon before replacing it, bounded by the supervisor's probe
+/// deadline.
+pub async fn quiesce_endpoint(endpoint: &Endpoint) -> Option<u32> {
+    quiesce_endpoint_with_timeout(endpoint, PROBE_TIMEOUT).await
 }
 
 /// Probe an endpoint using the supervisor's bounded fast-path deadline.
@@ -875,5 +983,105 @@ mod tests {
             !pipe_open_error_is_busy(&no_code),
             "an error with no OS code must NOT classify as busy"
         );
+    }
+
+    /// spec 004 review: "quiescing can never block a replacement" was argued
+    /// from construction (a 500 ms wrapper and a `_ => {}` arm) and all three
+    /// reviewers accepted it as CONFIRMED-by-trace while flagging the absent
+    /// test. These execute it.
+    ///
+    /// `quiesce_handshake` is generic over the stream, so a `duplex` pair
+    /// stands in for a peer on every platform -- no socket, no second daemon
+    /// binary, and no reliance on the reviewer's reading of the old daemon's
+    /// dispatch.
+    mod quiesce_fallback {
+        use super::*;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        /// Read the request frame a probe writes, then reply with `body`.
+        async fn reply_with(mut server: tokio::io::DuplexStream, body: &'static [u8]) {
+            let mut len = [0_u8; 4];
+            if server.read_exact(&mut len).await.is_err() {
+                return;
+            }
+            let n = u32::from_be_bytes(len) as usize;
+            let mut req = vec![0_u8; n];
+            if server.read_exact(&mut req).await.is_err() {
+                return;
+            }
+            let out_len = u32::try_from(body.len()).expect("small frame");
+            let _ = server.write_all(&out_len.to_be_bytes()).await;
+            let _ = server.write_all(body).await;
+        }
+
+        #[tokio::test]
+        async fn a_well_formed_ack_yields_the_recorded_count() {
+            let (client, server) = tokio::io::duplex(4096);
+            tokio::spawn(reply_with(
+                server,
+                br#"{"result":{"kind":"ok","response":{"method":"quiesce_ack","recorded":3}}}"#,
+            ));
+            assert_eq!(
+                quiesce_handshake(client).await,
+                Some(3),
+                "a current daemon's ack must surface its abandoned count"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_peer_that_rejects_the_verb_falls_through_instead_of_erroring() {
+            // A pre-004 daemon does not know `quiesce_for_replace` and answers
+            // with an error envelope. That MUST read as "no answer" so the
+            // caller proceeds to the kill, never as a failure that could stall
+            // or abort the replacement.
+            let (client, server) = tokio::io::duplex(4096);
+            tokio::spawn(reply_with(
+                server,
+                br#"{"result":{"kind":"err","code":"unknown_method"}}"#,
+            ));
+            assert_eq!(
+                quiesce_handshake(client).await,
+                None,
+                "an old daemon's rejection must fall through to the kill path"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_peer_that_answers_something_else_is_not_mistaken_for_an_ack() {
+            let (client, server) = tokio::io::duplex(4096);
+            tokio::spawn(reply_with(
+                server,
+                br#"{"result":{"kind":"ok","response":{"method":"health","uptime_secs":5}}}"#,
+            ));
+            assert_eq!(quiesce_handshake(client).await, None);
+        }
+
+        #[tokio::test]
+        async fn a_silent_peer_cannot_hang_the_replacement() {
+            // The failure that would actually hurt: a peer that accepts the
+            // connection and never replies. The handshake itself has no
+            // deadline by design -- the caller owns it -- so this pins that the
+            // caller's bound is what stops it.
+            let (client, _server) = tokio::io::duplex(4096);
+            let started = std::time::Instant::now();
+            let out = tokio::time::timeout(PROBE_TIMEOUT, quiesce_handshake(client)).await;
+            assert!(out.is_err(), "a silent peer must not resolve to an answer");
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "the replacement must not wait on a silent daemon; took {:?}",
+                started.elapsed()
+            );
+        }
+
+        #[tokio::test]
+        async fn the_replacement_deadline_stays_short() {
+            // `replace_if_stale` calls quiesce BEFORE hard_kill on every
+            // adapter start, so this bound is paid on every upgrade. If it
+            // grows, that cost is silently added to every replacement.
+            assert!(
+                PROBE_TIMEOUT <= Duration::from_millis(500),
+                "quiesce is on the replacement hot path; PROBE_TIMEOUT is {PROBE_TIMEOUT:?}"
+            );
+        }
     }
 }

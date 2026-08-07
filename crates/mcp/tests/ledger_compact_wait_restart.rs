@@ -265,9 +265,9 @@ async fn command_status_after_restart_returns_restart_marked_terminal() {
     let data = tmp_data_dir("restart");
 
     // --- Phase 1: run a command to exit, capture its job_id. ---
-    let job_id = {
+    let (job_id, live_frames, live_bytes, live_duration, live_probe) = {
         let handle = spawn_live_daemon(&data);
-        let job_id = {
+        let captured = {
             let (_server, client) = paired_against_live_daemon(&handle).await;
             let body = call_json(
                 &client,
@@ -285,14 +285,36 @@ async fn command_status_after_restart_returns_restart_marked_terminal() {
                 "command should have exited within the budget; body: {body}"
             );
             let job_id = body["job_id"].as_str().expect("job_id present").to_owned();
+
+            // spec 004 US1 / review (grok MEDIUM, composer falsification 4):
+            // capture what a LIVE observer saw, so phase 2 can demand the same
+            // numbers back. Without this the restart test only proved a
+            // terminal state survived; a regression that persisted the receipt
+            // but dropped `metrics_json` would keep CI green while recreating
+            // the original "true pass, zero evidence" re-run loss.
+            let live = call_json(
+                &client,
+                "command_status",
+                serde_json::json!({ "job_id": job_id }),
+            )
+            .await;
+            let frames = live["frames_total"].as_u64().unwrap_or_default();
+            let bytes = live["bytes_total"].as_u64().unwrap_or_default();
+            let duration = live["duration_ms"].as_u64();
+            let probe = live["probe_id"].as_str().unwrap_or_default().to_owned();
+            assert!(
+                frames > 0 && bytes > 0,
+                "the live observation must be non-zero or the comparison below \
+                 is vacuous; body: {live}"
+            );
             let _ = client.cancel().await;
-            job_id
+            (job_id, frames, bytes, duration, probe)
         };
         // Drop the daemon: its in-memory job map is gone, the receipt is on
         // disk (the receipt write is synchronous through the store actor on the
         // terminal transition, which completed before `complete:true` above).
         handle.shutdown().await;
-        job_id
+        captured
     };
 
     // --- Phase 2: re-bootstrap on the SAME data dir and poll status. ---
@@ -313,10 +335,40 @@ async fn command_status_after_restart_returns_restart_marked_terminal() {
                 serde_json::json!(true),
                 "post-restart status must be restart-marked; body: {body}"
             );
+            assert_eq!(
+                body["outcome_trust"],
+                serde_json::json!("reconstructed"),
+                "post-restart status must say HOW it knows; body: {body}"
+            );
             let state = body["state"].as_str().unwrap_or("");
             assert_eq!(
                 state, "exited",
                 "post-restart terminal state must be exited; body: {body}"
+            );
+
+            // The evidence must survive the process restart, not merely the
+            // state. These are compared against the LIVE observation captured
+            // in phase 1, across a real daemon death -- the gap both reviewers
+            // flagged as covered only by manual dogfood.
+            assert_eq!(
+                body["frames_total"].as_u64(),
+                Some(live_frames),
+                "reconstructed frames must match the live observation; body: {body}"
+            );
+            assert_eq!(
+                body["bytes_total"].as_u64(),
+                Some(live_bytes),
+                "reconstructed bytes must match the live observation; body: {body}"
+            );
+            assert_eq!(
+                body["duration_ms"].as_u64(),
+                live_duration,
+                "reconstructed duration must match the live observation; body: {body}"
+            );
+            assert_eq!(
+                body["probe_id"].as_str(),
+                Some(live_probe.as_str()),
+                "reconstructed probe_id must match the live observation; body: {body}"
             );
             let _ = client.cancel().await;
         }

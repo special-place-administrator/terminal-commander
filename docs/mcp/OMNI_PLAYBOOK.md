@@ -147,6 +147,12 @@ pty_command_stop { job_id }
   string (`posix`, `windows_conpty`, or `unavailable`).
 - The secret-prompt guard refuses LLM-supplied input while a password
   prompt is detected.
+- A PTY job's lifecycle is readable with `command_status` using its `job_id`,
+  and its counters are REAL -- the status read is answered by the PTY lane that
+  owns the probe. This is also the only surface that reports a FINISHED PTY
+  job's exit code, because `pty_command_list` filters terminal jobs out.
+  Every status response carries `outcome_trust` (`observed` | `reconstructed` |
+  `lost` | `abandoned`) saying how the daemon knows.
 - Honest host caveat: live Windows ConPTY child-output end-to-end is
   gated behind `TC_CONPTY_E2E=1` and not yet fully closed on every dev
   host; check `system_discover` before relying on it on native Windows.

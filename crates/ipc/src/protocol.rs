@@ -84,9 +84,16 @@ pub struct CommandStartResponse {
 /// never returns raw output": a bounded, truthful tail so a zero-rule
 /// command does not read as breakage.
 ///
-/// PTY/file-watch jobs never reach this path (`CommandService` holds
-/// process probes only; `handle_command_status` routes PTY job ids to
-/// `UnknownJob`), so a tail cannot include secret-prompt input.
+/// PTY and file-watch jobs never produce a receipt: it is built solely in the
+/// combed lifecycle waiter, and the other lanes have no binding in the command
+/// runtime's live map, so this field stays `None` for them. A tail therefore
+/// cannot include secret-prompt input.
+///
+/// An earlier version of this comment claimed `handle_command_status` routed
+/// PTY job ids to `UnknownJob`. It never did -- the job ledger is shared across
+/// lanes -- and that gap is the defect spec 004 fixes by routing a status read
+/// to the runtime that owns the job. The no-secret-leak conclusion above holds
+/// on its own terms, independent of that routing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandReceipt {
     pub exit_code: Option<i32>,
@@ -99,6 +106,41 @@ pub struct CommandReceipt {
     /// True when the ring evicted earlier frames; the tail may omit
     /// the start of output.
     pub tail_incomplete: bool,
+}
+
+/// How a reported outcome was established (spec 004 FR-006).
+///
+/// Present on EVERY [`CommandStatusResponse`], never conditionally omitted, so
+/// the normal and degraded shapes cannot drift apart. Constitution VII requires
+/// public diagnostics to use closed typed codes rather than free text, which is
+/// why this is a fixed enum and not a note field.
+///
+/// ## "lost" is deliberately NOT a value here
+///
+/// A job the daemon recorded starting and never recorded finishing has no
+/// outcome to report, so it is not a status payload at all: it is delivered as
+/// a typed [`IpcErrorCode::JobLost`] error. An earlier draft carried a `Lost`
+/// variant and the agent-facing docs promised it as a field value, but nothing
+/// ever constructed it -- an agent branching on `outcome_trust == "lost"` would
+/// have waited forever for a value that could not arrive (found by all three
+/// reviewers of this branch). Every variant below has a live construction site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeTrust {
+    /// The daemon witnessed this outcome live. Every counter is a real
+    /// observation.
+    #[default]
+    Observed,
+    /// Read back from the durable receipt after the in-memory job was gone.
+    /// `state` and `exit_code` are truthful; the counters are the values
+    /// captured when the job finished. Receipts written before the evidence
+    /// migration carry no counters, and that absence is reported honestly.
+    Reconstructed,
+    /// Ended by daemon shutdown or stale replacement rather than reaching its
+    /// own conclusion. Reported with lifecycle state `Cancelled` and no exit
+    /// code -- deliberately NOT a failure, and deliberately not a new
+    /// [`JobState`](terminal_commander_core::JobState) variant (spec D1).
+    Abandoned,
 }
 
 /// Bounded status shape. Counters + final exit state only.
@@ -126,14 +168,26 @@ pub struct CommandStatusResponse {
     /// with zero rule-driven events. See [`CommandReceipt`].
     pub receipt: Option<CommandReceipt>,
     /// TC-B3 (FR-027): `true` when this status was reconstructed from a
-    /// PERSISTED job receipt because the in-memory job is gone (a daemon
-    /// restart happened since the job ran). The terminal `state` /
-    /// `exit_code` are then authoritative-from-disk; the live counters
-    /// (`frames_*`, `bytes_total`) are zero because the in-memory probe
-    /// metrics did not survive. An honest terminal result, never a bare
-    /// error. Defaults to `false`; additive and non-breaking.
+    /// PERSISTED job receipt because the in-memory job was gone (a daemon
+    /// restart happened since the job ran).
+    ///
+    /// Retained as the backward-compatible alias for "this outcome was NOT
+    /// observed live", i.e. `outcome_trust != OutcomeTrust::Observed`. It is
+    /// therefore `true` for both `Reconstructed` and `Abandoned`, both of which
+    /// are read back from the durable receipt. Derive it from `outcome_trust`
+    /// rather than setting the two independently, so they cannot drift.
+    ///
+    /// NOTE: an earlier version of this comment said the live counters are
+    /// "zero because the in-memory probe metrics did not survive". That is no
+    /// longer true -- spec 004 persists the evidence a live observer would have
+    /// had, so a reconstructed status carries real counters. Only receipts
+    /// written before that migration lack them.
     #[serde(default)]
     pub restarted: bool,
+    /// How this outcome was established. See [`OutcomeTrust`]. Defaults to
+    /// `Observed` so a payload from an older daemon decodes unchanged.
+    #[serde(default)]
+    pub outcome_trust: OutcomeTrust,
 }
 
 /// Params for `command_stop` (TC-3): force-kill a running combed
@@ -252,7 +306,8 @@ pub const MAX_PULL_TIMEOUT_MS: u64 = 8_000;
 ///
 /// Method names are namespaced `<domain>_<verb>` to match the MCP tool
 /// names; the rmcp adapter maps each daemon-backed tool 1:1 to a method.
-/// 49 IPC methods are live, including the `audit_since` read surface.
+/// 50 IPC methods are live, including the `audit_since` read surface and the
+/// supervisor-only `quiesce_for_replace` verb.
 /// The full rmcp catalogue exposes 51 granular tools (see
 /// `docs/mcp/TOOL_CONTROL_SURFACE.md` §2); the compact MCP surface instead
 /// advertises five facade tools, gated by `TC_SURFACE=compact`, that forward
@@ -427,6 +482,23 @@ pub enum IpcRequest {
     /// requests, removes its pidfile, and exits 0. New connections during the
     /// drain receive `ShuttingDown` (retryable).
     Shutdown,
+    /// spec 004 FR-013: ask a daemon that is about to be REPLACED to durably
+    /// record its in-flight jobs as abandoned before it is killed.
+    ///
+    /// The replacer cannot do this itself: the in-flight set lives in the
+    /// outgoing daemon's memory, not on disk. So the outgoing daemon writes its
+    /// own records, and the replacer waits a bounded beat before hard-killing
+    /// as it does today.
+    ///
+    /// Strictly weaker than [`Self::Shutdown`]: spawns nothing, kills nothing,
+    /// exits nothing. It only writes rows about the daemon's own jobs, so it
+    /// carries the same authorization posture -- protected by the local-only
+    /// endpoint and attested peer identity, not by a capability flag.
+    ///
+    /// Quiescing MUST NEVER be able to block a replacement: a timeout, an
+    /// error, or an older daemon that does not know this verb all fall back to
+    /// current behaviour.
+    QuiesceForReplace,
 }
 
 impl IpcRequest {
@@ -509,7 +581,12 @@ impl IpcRequest {
             // Contrast BucketWait, which is client-cursor-driven and fully
             // replayable.
             | Self::SubscriptionPull(_)
-            | Self::Shutdown => false,
+            | Self::Shutdown
+            // spec 004 FR-013. The write itself is idempotent (INSERT OR
+            // REPLACE of the same terminal row), but it is still a server-side
+            // mutation and the caller is about to kill this daemon anyway --
+            // a blind retry buys nothing. Grouped conservatively with Shutdown.
+            | Self::QuiesceForReplace => false,
 
             // Pure bounded reads + idempotent-effect repositioning: a
             // retry observes state without changing it (or re-applies the
@@ -644,6 +721,11 @@ pub enum IpcResponse {
     /// new connections and begun draining.
     ShutdownAck {
         draining: bool,
+    },
+    /// ACK for [`IpcRequest::QuiesceForReplace`]: how many in-flight jobs were
+    /// recorded as abandoned. Zero is a normal answer (an idle daemon).
+    QuiesceAck {
+        recorded: u32,
     },
 }
 
@@ -827,6 +909,15 @@ pub enum IpcErrorCode {
     /// `command_status` was called with a job id the daemon does not
     /// know.
     UnknownJob,
+    /// `command_status` was called with a job id the daemon durably recorded
+    /// STARTING but never recorded finishing -- the daemon died before the
+    /// terminal transition. Distinct from [`Self::UnknownJob`], which means no
+    /// durable record exists at all. Never accompanied by a terminal outcome.
+    ///
+    /// Deliberately an error code rather than a lifecycle state: "the daemon
+    /// lost the thread" is not a job lifecycle state, and an unknown error code
+    /// fails closed for older clients.
+    JobLost,
     /// `registry_get` / `registry_test` / `registry_activate` /
     /// `registry_deactivate` referenced a `(rule_id, version?)` the
     /// daemon does not know.
