@@ -2079,7 +2079,7 @@ async fn drive_to_exit(mut probe: ProcessProbe) -> (ProcessProbeMetrics, ProbeOu
 /// persistent output, which is why the no-silence tail is deliberately absent
 /// here (spec decision D2). Every value below is either a counter or an opaque
 /// id, so no escaping is required and the string cannot carry stream content.
-fn evidence_json(
+pub(crate) fn evidence_json(
     metrics: &ProcessProbeMetrics,
     duration_ms: Option<u64>,
     probe_id: ProbeId,

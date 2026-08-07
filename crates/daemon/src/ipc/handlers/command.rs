@@ -162,50 +162,42 @@ pub(in crate::ipc::server) fn handle_command_status(
     state: &Arc<DaemonState>,
     params: &CommandStatusParams,
 ) -> Result<IpcResponse, IpcError> {
-    match state.command.status(params.job_id) {
-        Ok(resp) => Ok(IpcResponse::CommandStatus(resp)),
-        // The combed runtime declined: either it does not own this lane's job
-        // (spec 004 FR-004) or the in-memory job is gone entirely.
-        Err(crate::command::CommandError::UnknownJob(job_id)) => {
-            // 1. Ask the lane that owns it. A PTY or watch job answers here
-            //    with REAL counters. Constitution VII forbids discarding a live
-            //    job behind a bare error, and `command_status` is today the only
-            //    surface exposing a finished PTY job's exit code at all.
-            #[cfg(any(unix, windows))]
-            if let Some(resp) = state.pty.status(job_id) {
-                return Ok(IpcResponse::CommandStatus(resp));
-            }
-            if let Some(resp) = state.watch.status(job_id) {
-                return Ok(IpcResponse::CommandStatus(resp));
-            }
-            // 2. No live owner. Consult the persisted receipt: a known terminal
-            //    outcome from disk beats a bare "unknown job" (constitution VII
-            //    honest degradation).
-            if let Some(resp) = state.command.reconstructed_status(job_id) {
-                return Ok(IpcResponse::CommandStatus(resp));
-            }
-            // 3. No receipt exists. Did the daemon durably record this job
-            //    STARTING? If so it is LOST: it began and never reached a
-            //    recorded terminal transition, which is a diagnosis rather than
-            //    the "never heard of it" that `UnknownJob` implies.
-            //
-            //    Fails safe (spec FR-011). Audit emits are dropped on failure at
-            //    the call site, so absence is not proof; an errored or empty
-            //    lookup degrades to `UnknownJob` and NEVER to a terminal
-            //    outcome. The failure direction is one-way by construction.
-            let wire = job_id.to_wire_string();
-            if state.store.job_start_recorded(&wire).unwrap_or(false) {
-                return Err(IpcError::new(
-                    IpcErrorCode::JobLost,
-                    format!("job {wire} started but never recorded a terminal transition"),
-                ));
-            }
-            Err(map_command_error(crate::command::CommandError::UnknownJob(
-                job_id,
-            )))
-        }
-        Err(e) => Err(map_command_error(e)),
+    // 1. Ask the lane that OWNS this job. The ledger is shared across lanes, so
+    //    the combed runtime declines jobs whose metrics live elsewhere; a PTY or
+    //    watch job answers here with REAL counters. Constitution VII forbids
+    //    discarding a live job behind a bare error, and `command_status` is
+    //    today the only surface exposing a finished PTY job's exit code at all.
+    if let Some(resp) = state.live_lane_status(params.job_id) {
+        return Ok(IpcResponse::CommandStatus(resp));
     }
+    let job_id = params.job_id;
+
+    // 2. No live owner. Consult the persisted receipt: a known terminal outcome
+    //    from disk beats a bare "unknown job" (constitution VII honest
+    //    degradation).
+    if let Some(resp) = state.command.reconstructed_status(job_id) {
+        return Ok(IpcResponse::CommandStatus(resp));
+    }
+
+    // 3. No receipt exists. Did the daemon durably record this job STARTING? If
+    //    so it is LOST: it began and never reached a recorded terminal
+    //    transition, which is a diagnosis rather than the "never heard of it"
+    //    that `UnknownJob` implies.
+    //
+    //    Fails safe (spec FR-011). Audit emits are dropped on failure at the
+    //    call site, so absence is not proof; an errored or empty lookup degrades
+    //    to `UnknownJob` and NEVER to a terminal outcome. The failure direction
+    //    is one-way by construction.
+    let wire = job_id.to_wire_string();
+    if state.store.job_start_recorded(&wire).unwrap_or(false) {
+        return Err(IpcError::new(
+            IpcErrorCode::JobLost,
+            format!("job {wire} started but never recorded a terminal transition"),
+        ));
+    }
+    Err(map_command_error(crate::command::CommandError::UnknownJob(
+        job_id,
+    )))
 }
 
 pub(in crate::ipc::server) fn handle_command_output_tail(

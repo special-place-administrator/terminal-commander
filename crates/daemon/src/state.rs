@@ -163,6 +163,105 @@ impl std::fmt::Debug for DaemonState {
 }
 
 impl DaemonState {
+    /// spec 004 FR-012 / D1: record abandonment for every job still non-terminal
+    /// when the daemon shuts down.
+    ///
+    /// Called AFTER the lifecycle drain (so a command that finished inside the
+    /// shutdown window has already written its own real receipt) and BEFORE
+    /// `shutdown_store` (so the store is still writable). Anything still
+    /// non-terminal at this point was ended BY the shutdown rather than by itself.
+    ///
+    /// The terminal state recorded is `Cancelled`, which is truthful -- the job was
+    /// terminated -- and the cause rides in `end_cause`. Deliberately NOT a new
+    /// `JobState` variant, and deliberately not `Failed`: an abandoned job did not
+    /// fail, and an unrecognised terminal label is coerced to `Failed` on read,
+    /// which would manufacture exactly the false negative this feature removes.
+    ///
+    /// Evidence comes from the lane that owns the job, so an abandoned job still
+    /// reports the work it actually did before being cut off.
+    ///
+    /// Best-effort throughout: a job that vanishes mid-iteration or a failed write
+    /// is logged and skipped. Shutdown must not be blockable by bookkeeping.
+    pub fn record_abandoned_jobs(&self) {
+        use terminal_commander_core::JobState;
+
+        let mut recorded = 0_u32;
+        for rec in self.jobs.list() {
+            if matches!(
+                rec.state,
+                JobState::Exited | JobState::Failed | JobState::Cancelled
+            ) {
+                continue;
+            }
+            let job_id = rec.config.job_id;
+            // Reuse the shared lane routing so the counters come from whichever
+            // runtime actually holds the probe.
+            let live = self.live_lane_status(job_id);
+            let (evidence, events) = live.as_ref().map_or((None, 0), |s| {
+                let metrics = terminal_commander_probes::ProcessProbeMetrics {
+                    frames_total: s.frames_total,
+                    frames_stdout: s.frames_stdout,
+                    frames_stderr: s.frames_stderr,
+                    bytes_total: s.bytes_total,
+                    events_emitted: s.events_emitted,
+                    frames_suppressed: s.frames_suppressed,
+                    frames_suppressed_progress: s.frames_suppressed_progress,
+                    frames_suppressed_dedupe: s.frames_suppressed_dedupe,
+                };
+                (
+                    Some(crate::command::evidence_json(
+                        &metrics,
+                        s.duration_ms,
+                        s.probe_id,
+                    )),
+                    s.events_emitted,
+                )
+            });
+            crate::command::persist_job_receipt(
+                &self.store,
+                job_id,
+                rec.config.bucket_id,
+                JobState::Cancelled,
+                // An abandoned job produced no exit status. Never invent one.
+                None,
+                events,
+                evidence.as_deref(),
+                Some("abandoned"),
+            );
+            recorded = recorded.saturating_add(1);
+        }
+        if recorded > 0 {
+            tracing::info!(
+                abandoned_jobs = recorded,
+                "recorded abandonment for jobs still in flight at shutdown"
+            );
+        }
+    }
+
+    /// spec 004 FR-004: live status from the runtime that OWNS this job.
+    ///
+    /// The job ledger is shared across lanes, so no single runtime can answer
+    /// for all of them and `CommandRuntime::status` deliberately declines a job
+    /// it does not own. This walks the lanes in order and returns the first
+    /// real answer, so counters always come from the runtime holding the probe.
+    ///
+    /// `None` means no lane holds it live -- the caller then decides between
+    /// reconstruction, lost, and unknown.
+    #[must_use]
+    pub fn live_lane_status(
+        &self,
+        job_id: terminal_commander_core::JobId,
+    ) -> Option<crate::command::CommandStatusResponse> {
+        if let Ok(resp) = self.command.status(job_id) {
+            return Some(resp);
+        }
+        #[cfg(any(unix, windows))]
+        if let Some(resp) = self.pty.status(job_id) {
+            return Some(resp);
+        }
+        self.watch.status(job_id)
+    }
+
     /// Bootstrap the full daemon runtime from a validated config.
     ///
     /// Steps:
