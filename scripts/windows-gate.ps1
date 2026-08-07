@@ -42,6 +42,15 @@ Invoke-Gate 'terminal-commander-supervisor' 'probe_handshake_windows' @()
 Invoke-Gate 'terminal-commanderd' 'windows_spawn_site_coverage' @()
 # T1: collect_probes PTY cfg must admit Windows (headless-safe; live ConPTY is not).
 Invoke-Gate 'terminal-commanderd' 'runtime_state_windows' @('collect_probes_pty_enumeration_cfg_admits_windows')
+# spec 004 T5: Windows Job Object ownership tripwire. KILL_ON_JOB_CLOSE killing a
+# child while a waiter can still observe `probe.wait()` would let a killed child
+# persist a clean `exited, 0`. That cannot happen because the waiter itself owns
+# an Arc to the job handle across the wait -- an OWNERSHIP argument, not a
+# sequencing one. Forcing the failure would need a test-only seam in production
+# code (constitution VI forbids), so per CONTRIBUTING 6.1 the invariant is
+# recorded and guarded structurally. Registered here so a refactor that breaks
+# the argument fails the gate instead of silently removing the guarantee.
+Invoke-Gate 'terminal-commanderd' 'windows_job_object_ownership' @()
 
 # F-010 / O-07: live ConPTY child-output + secret-gate e2e. Runs on GitHub Actions
 # (required pre-build-gates-windows) and when a developer opts in with
